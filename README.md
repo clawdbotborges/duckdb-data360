@@ -10,7 +10,7 @@ Implemented and verified:
 - a read-only table-function registration, `data360_query(sql, secret_name)`;
 - fail-closed named-secret lookup (credentials are never accepted as SQL literals);
 - a transport-independent Query API V3 client contract;
-- asynchronous polling and multi-chunk traversal;
+- asynchronous polling and lazy, incrementally bounded JSON-chunk traversal;
 - canonical HTTPS-origin validation for exact `*.c360a.salesforce.com` DNS hosts;
 - request and overall timeouts;
 - best-effort remote `DELETE` with an independent 250 ms curl/process deadline when a local query is cancelled or
@@ -23,14 +23,13 @@ Implemented and verified:
 - a trusted process-local capability broker boundary;
 - concrete TLS-verified HTTPS with redirects refused and bounded responses;
 - Query API V3 submission-ID recovery from Salesforce response headers;
-- metadata-driven DuckDB binding and typed JSON-row output;
+- metadata-driven DuckDB binding and one-chunk-at-a-time typed JSON-row vector output;
 - live verification against the 32-row, 29-column synthetic Data 360 fixture.
 
 Not yet implemented:
 
 - native Arrow IPC decoding and Arrow-to-vector conversion;
-- incremental bounded chunk streaming into DuckDB vectors; the current JSON path applies aggregate row/cell/byte
-  limits but materializes the bounded result during global scan initialization;
+
 - provider precision/scale-driven decimal binding; the current `numeric` alias maps conservatively to `DECIMAL(38,18)`;
 - production Sowvi control-plane capability issuance (the current Python broker is development-local);
 - predicate/projection pushdown beyond SQL explicitly supplied to `data360_query`;
@@ -40,7 +39,9 @@ The native connector currently uses Query API JSON chunks. Arrow IPC access is i
 `../salesforce-data360-fixture/scripts/data360_oauth_smoke.py`, but must not be claimed as native-extension support.
 DuckDB requires output names and types during binding. With no separate Data 360 describe endpoint currently wired,
 bind submits the read-only query and retrieves only its authoritative metadata; it does not download result chunks.
-Execution creates a fresh query and downloads the bounded JSON result during global scan initialization.
+Execution creates a fresh query during global scan initialization without downloading a result chunk. The single-threaded
+scan fetches and validates one non-empty bounded JSON chunk at a time, retaining only the current remote chunk while it
+fills DuckDB vectors.
 
 ## Security boundary
 
@@ -84,9 +85,10 @@ build/debug/extension/data360/data360.duckdb_extension
 ## Tests
 
 ```bash
-# Transport, cancellation, timeout, tenant validation, chunks, and type mappings
+# Transport, cancellation, timeout, tenant validation, cursor/chunk bounds, scan-adapter vectors, and type mappings
 ctest --test-dir build/debug/extension/data360 --output-on-failure
 build/debug/extension/data360/data360_unit_tests
+build/debug/extension/data360/data360_scan_tests
 
 # DuckDB SQLLogic registration and fail-closed behavior
 build/debug/test/unittest test/sql/data360_query.test

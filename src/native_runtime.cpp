@@ -253,6 +253,15 @@ bool TryUnsigned(yyjson_val *value, uint64_t &result) {
 	}
 }
 
+bool OptionalUnsigned(yyjson_val *object, const char *key, uint64_t &result) {
+	auto value = yyjson_obj_get(object, key);
+	if (!value) return false;
+	if (!TryUnsigned(value, result)) {
+		throw std::runtime_error("Data 360 response contained an invalid count");
+	}
+	return true;
+}
+
 std::string RequiredString(yyjson_val *object, const char *key) {
 	auto value = yyjson_obj_get(object, key);
 	if (!yyjson_is_str(value) || yyjson_get_len(value) == 0) {
@@ -462,35 +471,16 @@ QueryResponse JsonQueryResponseCodec::Decode(const HttpResponse &response) {
 		const std::string state(yyjson_get_str(completion), yyjson_get_len(completion));
 		result.state = (state == "FINISHED" || state == "RESULTS_PRODUCED") ? QueryState::COMPLETE
 		                                                                  : (state == "RUNNING" ? QueryState::RUNNING : QueryState::FAILED);
-		auto chunk_count = yyjson_obj_get(root, "chunkCount");
-		result.has_chunk_count = TryUnsigned(chunk_count, result.chunk_count);
-		auto row_count = yyjson_obj_get(root, "rowCount");
-		result.has_row_count = TryUnsigned(row_count, result.row_count);
+		result.has_chunk_count = OptionalUnsigned(root, "chunkCount", result.chunk_count);
+		result.has_row_count = OptionalUnsigned(root, "rowCount", result.row_count);
 		return result;
 	}
 	if (!result.query_id.empty()) {
 		result.state = QueryState::RUNNING;
 		return result;
 	}
-	// Chunk responses can repeat metadata alongside the row payload. Prefer
-	// the data array here; the dedicated metadata endpoint is fetched first.
-	if (auto data = yyjson_obj_get(root, "data"); yyjson_is_arr(data)) {
-		size_t row_index, row_maximum;
-		yyjson_val *row;
-		yyjson_arr_foreach(data, row_index, row_maximum, row) {
-			if (!yyjson_is_arr(row)) throw std::runtime_error("Data 360 result row was invalid");
-			std::vector<Cell> cells;
-			size_t cell_index, cell_maximum;
-			yyjson_val *cell;
-			yyjson_arr_foreach(row, cell_index, cell_maximum, cell) {
-				cells.push_back(yyjson_is_null(cell) ? Cell() : Cell(JsonScalar(cell)));
-			}
-			result.chunk.rows.push_back(std::move(cells));
-		}
-		result.state = QueryState::COMPLETE;
-		result.has_returned_rows = TryUnsigned(yyjson_obj_get(root, "returnedRows"), result.returned_rows);
-		return result;
-	}
+	// Chunk responses can repeat metadata alongside the row payload. Decode both
+	// so the cursor can reject execution-time schema drift before yielding rows.
 	auto metadata_object = yyjson_obj_get(root, "metadata");
 	if (!yyjson_is_obj(metadata_object)) metadata_object = root;
 	if (auto columns = yyjson_obj_get(metadata_object, "columns"); yyjson_is_arr(columns)) {
@@ -508,6 +498,28 @@ QueryResponse JsonQueryResponseCodec::Decode(const HttpResponse &response) {
 			result.metadata.push_back({std::string(yyjson_get_str(name), yyjson_get_len(name)),
 			                           std::string(yyjson_get_str(type), yyjson_get_len(type)), yyjson_get_bool(nullable)});
 		}
+	}
+	if (auto data = yyjson_obj_get(root, "data"); yyjson_is_arr(data)) {
+		if (auto next = yyjson_obj_get(root, "next"); yyjson_is_str(next)) {
+			result.chunk.next_url = std::string(yyjson_get_str(next), yyjson_get_len(next));
+		}
+		size_t row_index, row_maximum;
+		yyjson_val *row;
+		yyjson_arr_foreach(data, row_index, row_maximum, row) {
+			if (!yyjson_is_arr(row)) throw std::runtime_error("Data 360 result row was invalid");
+			std::vector<Cell> cells;
+			size_t cell_index, cell_maximum;
+			yyjson_val *cell;
+			yyjson_arr_foreach(row, cell_index, cell_maximum, cell) {
+				cells.push_back(yyjson_is_null(cell) ? Cell() : Cell(JsonScalar(cell)));
+			}
+			result.chunk.rows.push_back(std::move(cells));
+		}
+		result.state = QueryState::COMPLETE;
+		result.has_returned_rows = OptionalUnsigned(root, "returnedRows", result.returned_rows);
+		return result;
+	}
+	if (!result.metadata.empty()) {
 		result.state = QueryState::COMPLETE;
 		return result;
 	}

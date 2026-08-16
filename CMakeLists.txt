@@ -13,6 +13,7 @@ set(EXTENSION_SOURCES
     src/data360_extension.cpp
     src/native_runtime.cpp
     src/query_api.cpp
+    src/scan_runtime.cpp
     src/type_mapping.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -35,3 +36,13 @@ target_compile_features(data360_unit_tests PRIVATE cxx_std_17)
 target_compile_options(data360_unit_tests PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(data360_unit_tests PRIVATE duckdb)
 add_test(NAME data360_unit_tests COMMAND data360_unit_tests)
+
+add_executable(data360_scan_tests
+    test/unit/data360_scan_test.cpp
+    src/scan_runtime.cpp
+    src/query_api.cpp)
+target_include_directories(data360_scan_tests PRIVATE src/include)
+target_compile_features(data360_scan_tests PRIVATE cxx_std_17)
+target_compile_options(data360_scan_tests PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+target_link_libraries(data360_scan_tests PRIVATE duckdb)
+add_test(NAME data360_scan_tests COMMAND data360_scan_tests)

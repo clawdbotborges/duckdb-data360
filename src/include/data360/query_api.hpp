@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -96,15 +97,55 @@ struct QueryResult {
 	std::vector<ResultChunk> chunks;
 };
 
+class QueryCursor;
+
+class PreparedQuery {
+public:
+	PreparedQuery(PreparedQuery &&) noexcept;
+	PreparedQuery &operator=(PreparedQuery &&) noexcept;
+	~PreparedQuery() noexcept;
+
+	PreparedQuery(const PreparedQuery &) = delete;
+	PreparedQuery &operator=(const PreparedQuery &) = delete;
+
+	const std::vector<ColumnMetadata> &Metadata() const;
+	QueryCursor OpenCursor() &&;
+
+private:
+	friend class QueryApiV3Client;
+	struct State;
+	explicit PreparedQuery(std::unique_ptr<State> state_p);
+	std::unique_ptr<State> state;
+};
+
+class QueryCursor {
+public:
+	QueryCursor(QueryCursor &&) noexcept;
+	QueryCursor &operator=(QueryCursor &&) noexcept;
+	~QueryCursor() noexcept;
+
+	QueryCursor(const QueryCursor &) = delete;
+	QueryCursor &operator=(const QueryCursor &) = delete;
+
+	bool NextChunk(ResultChunk &result);
+
+private:
+	friend class PreparedQuery;
+	struct State;
+	explicit QueryCursor(std::unique_ptr<State> state_p);
+	std::unique_ptr<State> state;
+};
+
 class QueryApiV3Client {
 public:
 	QueryApiV3Client(HttpTransport &transport, QueryResponseCodec &codec, RuntimeHooks &runtime,
 	                 QueryOptions options = {});
+	PreparedQuery Prepare(const std::string &sql, const QueryCredentials &credentials);
 	QueryResult Execute(const std::string &sql, const QueryCredentials &credentials);
 	QueryResult ExecuteMetadata(const std::string &sql, const QueryCredentials &credentials);
 
 private:
-	QueryResult ExecuteInternal(const std::string &sql, const QueryCredentials &credentials, bool metadata_only);
+	PreparedQuery PrepareInternal(const std::string &sql, const QueryCredentials &credentials, bool metadata_only);
 	HttpTransport &transport;
 	QueryResponseCodec &codec;
 	RuntimeHooks &runtime;

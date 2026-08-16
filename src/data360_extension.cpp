@@ -2,6 +2,7 @@
 
 #include "data360_extension.hpp"
 #include "data360/native_runtime.hpp"
+#include "data360/scan_runtime.hpp"
 #include "data360/type_mapping.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -39,6 +40,7 @@ class Data360BindData final : public TableFunctionData {
 public:
 	vector<LogicalType> types;
 	vector<string> names;
+	std::vector<data360::ColumnMetadata> metadata;
 	string sql;
 	string login_url;
 	string broker_path;
@@ -46,12 +48,6 @@ public:
 	bool SupportStatementCache() const override {
 		return false;
 	}
-};
-
-class Data360GlobalState final : public GlobalTableFunctionState {
-public:
-	vector<vector<Value>> rows;
-	idx_t offset = 0;
 };
 
 class DuckDBRuntime final : public data360::RuntimeHooks {
@@ -74,6 +70,20 @@ public:
 
 private:
 	ClientContext &context;
+};
+
+class Data360GlobalState final : public GlobalTableFunctionState {
+public:
+	explicit Data360GlobalState(ClientContext &context)
+	    : runtime(context), transport(&runtime), codec(), client(transport, codec, runtime) {
+	}
+
+	DuckDBRuntime runtime;
+	data360::CurlProcessTransport transport;
+	data360::JsonQueryResponseCodec codec;
+	data360::QueryApiV3Client client;
+	std::unique_ptr<data360::ChunkSource> source;
+	data360::ScanBuffer scan_buffer;
 };
 
 LogicalType BindLogicalType(const data360::TypeMapping &mapping) {
@@ -156,6 +166,7 @@ unique_ptr<FunctionData> Data360QueryBind(ClientContext &context, TableFunctionB
 			return_types.push_back(logical_type);
 			bind->types.push_back(std::move(logical_type));
 			bind->names.push_back(column.name);
+			bind->metadata.push_back(column);
 		}
 		return std::move(bind);
 	} catch (const BinderException &) {
@@ -168,50 +179,21 @@ unique_ptr<FunctionData> Data360QueryBind(ClientContext &context, TableFunctionB
 
 unique_ptr<GlobalTableFunctionState> Data360QueryInit(ClientContext &context, TableFunctionInitInput &input) {
 	const auto &bind = input.bind_data->Cast<Data360BindData>();
-	auto state = make_uniq<Data360GlobalState>();
-	DuckDBRuntime runtime(context);
+	auto state = make_uniq<Data360GlobalState>(context);
 	data360::QueryCredentials credentials;
 	try {
-		credentials = data360::ResolveProcessCapability(bind.broker_path, bind.login_url, &runtime);
+		credentials = data360::ResolveProcessCapability(bind.broker_path, bind.login_url, &state->runtime);
 	} catch (...) {
 		if (context.IsInterrupted()) throw InterruptException();
 		throw InvalidInputException("Data 360 capability resolution failed");
 	}
 	try {
-		data360::CurlProcessTransport transport(&runtime);
-		data360::JsonQueryResponseCodec codec;
-		data360::QueryApiV3Client client(transport, codec, runtime);
-		auto result = client.Execute(bind.sql, credentials);
-		if (result.metadata.size() != bind.names.size()) {
+		auto prepared = state->client.Prepare(bind.sql, credentials);
+		const auto &metadata = prepared.Metadata();
+		if (!data360::MetadataCompatible(bind.metadata, metadata)) {
 			throw InvalidInputException("Data 360 result schema changed after binding");
 		}
-		for (idx_t column = 0; column < result.metadata.size(); column++) {
-			const auto actual_type = BindLogicalType(data360::MapData360Type(result.metadata[column].type));
-			if (result.metadata[column].name != bind.names[column] || actual_type != bind.types[column]) {
-				throw InvalidInputException("Data 360 result schema changed after binding");
-			}
-		}
-		for (const auto &result_chunk : result.chunks) {
-			for (const auto &source_row : result_chunk.rows) {
-				if (source_row.size() != bind.types.size()) {
-					throw InvalidInputException("Data 360 query returned a row with the wrong column count");
-				}
-				vector<Value> row;
-				row.reserve(source_row.size());
-				for (idx_t column = 0; column < source_row.size(); column++) {
-					if (!source_row[column]) {
-						row.emplace_back(bind.types[column]);
-						continue;
-					}
-					try {
-						row.push_back(Value(*source_row[column]).DefaultCastAs(bind.types[column]));
-					} catch (...) {
-						throw InvalidInputException("Data 360 value conversion failed for column '%s'", bind.names[column]);
-					}
-				}
-				state->rows.push_back(std::move(row));
-			}
-		}
+		state->source = std::make_unique<data360::CursorChunkSource>(std::move(prepared).OpenCursor());
 		return std::move(state);
 	} catch (const InvalidInputException &) {
 		throw;
@@ -221,18 +203,17 @@ unique_ptr<GlobalTableFunctionState> Data360QueryInit(ClientContext &context, Ta
 	}
 }
 
-void Data360QueryFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+void Data360QueryFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	const auto &bind = input.bind_data->Cast<Data360BindData>();
 	auto &state = input.global_state->Cast<Data360GlobalState>();
-	idx_t count = 0;
-	while (state.offset < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
-		for (idx_t column = 0; column < bind.types.size(); column++) {
-			output.SetValue(column, count, state.rows[state.offset][column]);
-		}
-		state.offset++;
-		count++;
+	try {
+		data360::FillDataChunk(*state.source, state.scan_buffer, bind.types, bind.names, output);
+	} catch (const InvalidInputException &) {
+		throw;
+	} catch (...) {
+		if (context.IsInterrupted()) throw InterruptException();
+		throw InvalidInputException("Data 360 query execution failed");
 	}
-	output.SetCardinality(count);
 }
 
 void LoadInternal(ExtensionLoader &loader) {

@@ -153,6 +153,57 @@ void TestEscapesEveryJsonControlCharacterInSql() {
 	Require(body.find('\0') == std::string::npos, "raw NUL must not appear in JSON");
 }
 
+void TestNumberedCursorFetchesOneChunkAtATime() {
+	FakeRuntime runtime;
+	RecordingTransport transport;
+	transport.responses.push_back({200, "submitted"});
+	transport.responses.push_back({200, "finished"});
+	transport.responses.push_back({200, "metadata"});
+	transport.responses.push_back({200, "chunk-zero"});
+	transport.responses.push_back({200, "chunk-one"});
+	ScriptedCodec codec;
+	QueryResponse submitted;
+	submitted.state = QueryState::RUNNING;
+	submitted.query_id = "query-lazy";
+	codec.responses.push_back(submitted);
+	QueryResponse finished;
+	finished.state = QueryState::COMPLETE;
+	finished.query_id = "query-lazy";
+	finished.chunk_count = 2;
+	finished.has_chunk_count = true;
+	finished.row_count = 2;
+	finished.has_row_count = true;
+	codec.responses.push_back(finished);
+	QueryResponse metadata;
+	metadata.state = QueryState::COMPLETE;
+	metadata.metadata.push_back({"id", "varchar", false});
+	codec.responses.push_back(metadata);
+	for (const auto *value : {"A", "B"}) {
+		QueryResponse chunk;
+		chunk.state = QueryState::COMPLETE;
+		chunk.has_returned_rows = true;
+		chunk.returned_rows = 1;
+		chunk.chunk.rows.push_back({Cell(value)});
+		codec.responses.push_back(chunk);
+	}
+
+	QueryApiV3Client client(transport, codec, runtime);
+	auto prepared = client.Prepare("select id from fixture",
+	                               {"https://tenant.c360a.salesforce.com", "token"});
+	Require(prepared.Metadata().size() == 1, "prepare must retain execution metadata");
+	Require(transport.requests.size() == 3, "prepare must not fetch numbered chunks");
+	auto cursor = std::move(prepared).OpenCursor();
+	ResultChunk chunk;
+	Require(cursor.NextChunk(chunk), "first numbered chunk must be available");
+	Require(transport.requests.size() == 4 && chunk.rows[0][0].value() == "A",
+	        "one cursor call must fetch only chunk zero");
+	Require(cursor.NextChunk(chunk), "second numbered chunk must be available");
+	Require(transport.requests.size() == 5 && chunk.rows[0][0].value() == "B",
+	        "second cursor call must fetch only chunk one");
+	Require(!cursor.NextChunk(chunk), "cursor must reconcile and finish after advertised chunks");
+	Require(transport.requests.size() == 5, "final reconciliation must not issue another GET");
+}
+
 void TestRealV3LifecycleFetchesMetadataAndNumberedChunks() {
 	FakeRuntime runtime;
 	RecordingTransport transport;
@@ -248,7 +299,8 @@ void TestMetadataOnlyExecutionDoesNotFetchChunks() {
 	QueryApiV3Client client(transport, codec, runtime);
 	auto result = client.ExecuteMetadata("select account_id from accounts",
 	                                     {"https://tenant.c360a.salesforce.com", "token"});
-	Require(transport.requests.size() == 3, "metadata-only execution must not fetch result chunks");
+	Require(transport.requests.size() == 4 && transport.requests[3].method == "DELETE",
+	        "metadata-only execution must fetch no chunks and clean up the unopened query");
 	Require(transport.requests[0].body.find("\"queryRowLimit\":1") != std::string::npos,
 	        "metadata-only execution must request the minimum positive row limit");
 	Require(result.metadata.size() == 1 && result.chunks.empty(),
@@ -471,7 +523,8 @@ void TestRejectsFailedChunkAndPaginationCycle() {
 	} catch (const std::runtime_error &) {
 		rejected_cycle = true;
 	}
-	Require(rejected_cycle && cycle_transport.requests.size() == 2, "pagination cycle must be bounded");
+	Require(rejected_cycle && cycle_transport.requests.size() == 3 && cycle_transport.requests[2].method == "DELETE",
+	        "pagination cycle must be bounded and cancel remotely");
 }
 
 void TestCancellationStopsChunkTraversalBeforeNextRequest() {
@@ -497,6 +550,544 @@ void TestCancellationStopsChunkTraversalBeforeNextRequest() {
 	}
 	Require(cancelled && transport.requests.size() == 2, "cancellation must stop chunk traversal and cancel remotely");
 	Require(transport.requests[1].method == "DELETE", "chunk traversal cancellation must use DELETE");
+}
+
+void TestCancellationBetweenCursorCallsDeletesWithoutNextGet() {
+	FakeRuntime runtime;
+	RecordingTransport transport;
+	transport.responses.push_back({200, "first"});
+	transport.responses.push_back({204, ""});
+	ScriptedCodec codec;
+	QueryResponse first;
+	first.state = QueryState::COMPLETE;
+	first.query_id = "query-between-calls";
+	first.metadata.push_back({"id", "varchar", false});
+	first.chunk.rows.push_back({Cell("A")});
+	first.chunk.next_url = "/api/v3/query/query-between-calls/chunks/1";
+	codec.responses.push_back(first);
+	QueryApiV3Client client(transport, codec, runtime);
+	auto cursor = std::move(client.Prepare("select id from fixture",
+	                                      {"https://tenant.c360a.salesforce.com", "token"})).OpenCursor();
+	ResultChunk chunk;
+	Require(cursor.NextChunk(chunk) && transport.requests.size() == 1,
+	        "first cursor call must return the buffered chunk");
+	runtime.cancelled = true;
+	bool cancelled = false;
+	try { cursor.NextChunk(chunk); } catch (const std::runtime_error &) { cancelled = true; }
+	Require(cancelled && transport.requests.size() == 2,
+	        "cancellation between cursor calls must issue cleanup but no next chunk GET");
+	Require(transport.requests[1].method == "DELETE" && transport.requests[1].cleanup_request &&
+	            transport.requests[1].timeout_ms == 250,
+	        "between-call cancellation cleanup must be an independently bounded DELETE");
+}
+
+void TestZeroChunkCursorFinalizesWithoutChunkGetOrDelete() {
+	FakeRuntime runtime;
+	RecordingTransport transport;
+	transport.responses.push_back({200, "submitted"});
+	transport.responses.push_back({200, "finished"});
+	transport.responses.push_back({200, "metadata"});
+	ScriptedCodec codec;
+	QueryResponse submitted;
+	submitted.state = QueryState::RUNNING;
+	submitted.query_id = "query-zero";
+	codec.responses.push_back(submitted);
+	QueryResponse finished;
+	finished.state = QueryState::COMPLETE;
+	finished.has_chunk_count = true;
+	finished.has_row_count = true;
+	codec.responses.push_back(finished);
+	QueryResponse metadata;
+	metadata.state = QueryState::COMPLETE;
+	metadata.metadata.push_back({"id", "varchar", true});
+	codec.responses.push_back(metadata);
+	QueryApiV3Client client(transport, codec, runtime);
+	auto prepared = client.Prepare("select id from empty_fixture",
+	                               {"https://tenant.c360a.salesforce.com", "token"});
+	auto cursor = std::move(prepared).OpenCursor();
+	ResultChunk chunk;
+	Require(!cursor.NextChunk(chunk), "zero-chunk query must finalize immediately");
+	Require(transport.requests.size() == 3, "zero-chunk query must issue no chunk GET or cleanup DELETE");
+}
+
+void TestDirectCursorBuffersFirstChunkAndFetchesOneNextUrl() {
+	FakeRuntime runtime;
+	RecordingTransport transport;
+	transport.responses.push_back({200, "first"});
+	transport.responses.push_back({200, "second"});
+	ScriptedCodec codec;
+	QueryResponse first;
+	first.state = QueryState::COMPLETE;
+	first.metadata.push_back({"id", "varchar", false});
+	first.chunk.rows.push_back({Cell("A")});
+	first.chunk.next_url = "/api/v3/query/query-direct/chunks/1";
+	first.has_row_count = true;
+	first.row_count = 2;
+	codec.responses.push_back(first);
+	QueryResponse second;
+	second.state = QueryState::COMPLETE;
+	second.chunk.rows.push_back({Cell("B")});
+	codec.responses.push_back(second);
+	QueryApiV3Client client(transport, codec, runtime);
+	auto prepared = client.Prepare("select id from fixture",
+	                               {"https://tenant.c360a.salesforce.com", "token"});
+	Require(transport.requests.size() == 1, "direct prepare must buffer only the returned first chunk");
+	auto cursor = std::move(prepared).OpenCursor();
+	ResultChunk chunk;
+	Require(cursor.NextChunk(chunk) && chunk.rows[0][0].value() == "A" && transport.requests.size() == 1,
+	        "first direct cursor call must consume the buffered chunk without a GET");
+	Require(cursor.NextChunk(chunk) && chunk.rows[0][0].value() == "B" && transport.requests.size() == 2,
+	        "second direct cursor call must fetch exactly one validated next URL");
+	Require(!cursor.NextChunk(chunk) && transport.requests.size() == 2,
+	        "direct cursor must reconcile without cleanup after successful exhaustion");
+}
+
+void TestConcreteCodecDirectCursorFetchesOneNextUrlPerCall() {
+	FakeRuntime runtime;
+	RecordingTransport transport;
+	transport.responses.push_back({
+	    200,
+	    R"({"metadata":{"columns":[{"name":"id","type":"varchar","nullable":false}]},"data":[["A"]],"returnedRows":1,"next":"/api/v3/query/query-concrete/chunks/1"})"});
+	transport.responses.push_back({200, R"({"data":[["B"]],"returnedRows":1})"});
+	JsonQueryResponseCodec codec;
+	QueryApiV3Client client(transport, codec, runtime);
+	auto prepared = client.Prepare("select id from fixture",
+	                               {"https://tenant.c360a.salesforce.com", "token"});
+	Require(transport.requests.size() == 1, "concrete direct prepare must buffer its first response");
+	auto cursor = std::move(prepared).OpenCursor();
+	ResultChunk chunk;
+	Require(cursor.NextChunk(chunk) && chunk.rows[0][0].value() == "A" && transport.requests.size() == 1,
+	        "concrete direct first cursor call must not fetch its next URL");
+	Require(cursor.NextChunk(chunk) && chunk.rows[0][0].value() == "B" && transport.requests.size() == 2,
+	        "concrete direct second cursor call must fetch exactly one next URL");
+	Require(!cursor.NextChunk(chunk) && transport.requests.size() == 2,
+	        "concrete direct cursor must finish without an extra GET");
+}
+
+void TestRejectsQueryIdentityDriftAcrossLifecycle() {
+	const QueryCredentials credentials {"https://tenant.c360a.salesforce.com", "token"};
+	const auto require_rejected = [&](std::deque<QueryResponse> responses, const char *message) {
+		FakeRuntime runtime;
+		RecordingTransport transport;
+		for (size_t index = 0; index < responses.size() + 1; index++) transport.responses.push_back({200, "response"});
+		ScriptedCodec codec;
+		codec.responses = std::move(responses);
+		bool rejected = false;
+		try {
+			QueryApiV3Client client(transport, codec, runtime);
+			auto prepared = client.Prepare("select id from fixture", credentials);
+			auto cursor = std::move(prepared).OpenCursor();
+			ResultChunk chunk;
+			while (cursor.NextChunk(chunk)) {
+			}
+		} catch (const std::runtime_error &) {
+			rejected = true;
+		}
+		Require(rejected, message);
+	};
+
+	QueryResponse submitted;
+	submitted.state = QueryState::RUNNING;
+	submitted.query_id = "query-a";
+	QueryResponse mismatched_poll;
+	mismatched_poll.state = QueryState::COMPLETE;
+	mismatched_poll.query_id = "query-b";
+	mismatched_poll.has_chunk_count = true;
+	mismatched_poll.has_row_count = true;
+	require_rejected({submitted, mismatched_poll, QueryResponse {QueryState::COMPLETE, "", "", 0, 0, false,
+	                                                            false, 0, false, {{"id", "varchar", false}}, {}}},
+	                 "poll response must not change query identity");
+
+	QueryResponse finished;
+	finished.state = QueryState::COMPLETE;
+	finished.query_id = "query-a";
+	finished.has_chunk_count = true;
+	finished.chunk_count = 1;
+	finished.has_row_count = true;
+	finished.row_count = 0;
+	QueryResponse metadata;
+	metadata.state = QueryState::COMPLETE;
+	metadata.metadata.push_back({"id", "varchar", false});
+	QueryResponse mismatched_chunk;
+	mismatched_chunk.state = QueryState::COMPLETE;
+	mismatched_chunk.query_id = "query-b";
+	mismatched_chunk.has_returned_rows = true;
+	require_rejected({submitted, finished, metadata, mismatched_chunk},
+	                 "numbered chunk response must not change query identity");
+
+	QueryResponse direct;
+	direct.state = QueryState::COMPLETE;
+	direct.query_id = "query-a";
+	direct.metadata.push_back({"id", "varchar", false});
+	direct.chunk.rows.push_back({Cell("A")});
+	direct.chunk.next_url = "/api/v3/query/query-b/chunks/1";
+	direct.has_returned_rows = true;
+	direct.returned_rows = 1;
+	QueryResponse direct_terminal;
+	direct_terminal.state = QueryState::COMPLETE;
+	direct_terminal.chunk.rows.push_back({Cell("terminal")});
+	direct_terminal.has_returned_rows = true;
+	direct_terminal.returned_rows = 1;
+	require_rejected({direct, direct_terminal}, "initial direct pagination path must match query identity");
+
+	QueryResponse direct_first;
+	direct_first.state = QueryState::COMPLETE;
+	direct_first.query_id = "query-a";
+	direct_first.metadata.push_back({"id", "varchar", false});
+	direct_first.chunk.rows.push_back({Cell("A")});
+	direct_first.chunk.next_url = "/api/v3/query/query-a/chunks/1";
+	direct_first.has_returned_rows = true;
+	direct_first.returned_rows = 1;
+	QueryResponse direct_second;
+	direct_second.state = QueryState::COMPLETE;
+	direct_second.chunk.rows.push_back({Cell("B")});
+	direct_second.chunk.next_url = "/api/v3/query/query-b/chunks/2";
+	direct_second.has_returned_rows = true;
+	direct_second.returned_rows = 1;
+	QueryResponse direct_third;
+	direct_third.state = QueryState::COMPLETE;
+	direct_third.chunk.rows.push_back({Cell("C")});
+	direct_third.has_returned_rows = true;
+	direct_third.returned_rows = 1;
+	require_rejected({direct_first, direct_second, direct_third},
+	                 "subsequent direct pagination path must match query identity");
+}
+
+void TestConcreteCodecRejectsMalformedAdvertisedCounts() {
+	JsonQueryResponseCodec codec;
+	for (const auto *body : {
+	         R"({"completionStatus":"FINISHED","chunkCount":-1,"rowCount":0})",
+	         R"({"completionStatus":"FINISHED","chunkCount":1.5,"rowCount":0})",
+	         R"({"completionStatus":"FINISHED","chunkCount":18446744073709551616,"rowCount":0})",
+	         R"({"completionStatus":"FINISHED","chunkCount":"1","rowCount":0})",
+	         R"({"completionStatus":"FINISHED","chunkCount":1,"rowCount":-1})",
+	         R"({"completionStatus":"FINISHED","chunkCount":1,"rowCount":1.5})",
+	         R"({"completionStatus":"FINISHED","chunkCount":1,"rowCount":18446744073709551616})",
+	         R"({"completionStatus":"FINISHED","chunkCount":1,"rowCount":"1"})",
+	         R"({"data":[],"returnedRows":-1})",
+	         R"({"data":[],"returnedRows":1.5})",
+	         R"({"data":[],"returnedRows":18446744073709551616})",
+	         R"({"data":[],"returnedRows":"0"})"}) {
+		bool rejected = false;
+		try {
+			(void)codec.Decode({200, body});
+		} catch (const std::runtime_error &) {
+			rejected = true;
+		}
+		Require(rejected, "present malformed count fields must fail closed");
+	}
+}
+
+void TestCursorReturnsAtMostOneNumberedChunkPerCall() {
+	FakeRuntime runtime;
+	RecordingTransport transport;
+	for (const auto *body : {"submitted", "finished", "metadata", "empty", "rows"})
+		transport.responses.push_back({200, body});
+	ScriptedCodec codec;
+	QueryResponse submitted;
+	submitted.state = QueryState::RUNNING;
+	submitted.query_id = "query-empty-middle";
+	codec.responses.push_back(submitted);
+	QueryResponse finished;
+	finished.state = QueryState::COMPLETE;
+	finished.has_chunk_count = true;
+	finished.chunk_count = 2;
+	finished.has_row_count = true;
+	finished.row_count = 1;
+	codec.responses.push_back(finished);
+	QueryResponse metadata;
+	metadata.state = QueryState::COMPLETE;
+	metadata.metadata.push_back({"id", "varchar", false});
+	codec.responses.push_back(metadata);
+	QueryResponse empty;
+	empty.state = QueryState::COMPLETE;
+	empty.has_returned_rows = true;
+	codec.responses.push_back(empty);
+	QueryResponse rows;
+	rows.state = QueryState::COMPLETE;
+	rows.chunk.rows.push_back({Cell("after-empty")});
+	codec.responses.push_back(rows);
+	QueryApiV3Client client(transport, codec, runtime);
+	auto cursor = std::move(client.Prepare("select id from fixture",
+	                                      {"https://tenant.c360a.salesforce.com", "token"})).OpenCursor();
+	ResultChunk chunk;
+	Require(cursor.NextChunk(chunk) && chunk.rows.empty(),
+	        "an empty numbered chunk must be returned without fetching the following chunk");
+	Require(transport.requests.size() == 4,
+	        "one cursor call must issue at most one numbered chunk GET");
+	Require(cursor.NextChunk(chunk) && chunk.rows[0][0].value() == "after-empty",
+	        "the next cursor call must fetch the following numbered chunk");
+	Require(transport.requests.size() == 5,
+	        "the second cursor call must issue exactly one additional numbered chunk GET");
+	Require(!cursor.NextChunk(chunk), "cursor must finalize after empty and non-empty chunks reconcile");
+}
+
+void TestCursorAppliesIncrementalBoundsAndCountChecks() {
+	{
+		FakeRuntime runtime;
+		RecordingTransport transport;
+		for (const auto *body : {"submitted", "finished", "metadata", "one", "two", "delete"})
+			transport.responses.push_back({200, body});
+		ScriptedCodec codec;
+		QueryResponse submitted;
+		submitted.state = QueryState::RUNNING;
+		submitted.query_id = "query-rows";
+		codec.responses.push_back(submitted);
+		QueryResponse finished;
+		finished.state = QueryState::COMPLETE;
+		finished.has_chunk_count = true;
+		finished.chunk_count = 2;
+		codec.responses.push_back(finished);
+		QueryResponse metadata;
+		metadata.state = QueryState::COMPLETE;
+		metadata.metadata.push_back({"id", "varchar", false});
+		codec.responses.push_back(metadata);
+		for (const auto *value : {"A", "B"}) {
+			QueryResponse rows;
+			rows.state = QueryState::COMPLETE;
+			rows.chunk.rows.push_back({Cell(value)});
+			codec.responses.push_back(rows);
+		}
+		QueryOptions options;
+		options.max_rows = 1;
+		QueryApiV3Client client(transport, codec, runtime, options);
+		auto cursor = std::move(client.Prepare("select id from fixture",
+		                                      {"https://tenant.c360a.salesforce.com", "token"})).OpenCursor();
+		ResultChunk chunk;
+		Require(cursor.NextChunk(chunk), "first row within cumulative limit must be returned");
+		bool rejected = false;
+		try { cursor.NextChunk(chunk); } catch (const std::runtime_error &) { rejected = true; }
+		Require(rejected && transport.requests.back().method == "DELETE",
+		        "cumulative row overflow must fail incrementally and cancel");
+	}
+	{
+		FakeRuntime runtime;
+		RecordingTransport transport;
+		for (const auto *body : {"submitted", "finished", "metadata", "chunk", "delete"})
+			transport.responses.push_back({200, body});
+		ScriptedCodec codec;
+		QueryResponse submitted;
+		submitted.state = QueryState::RUNNING;
+		submitted.query_id = "query-width";
+		codec.responses.push_back(submitted);
+		QueryResponse finished;
+		finished.state = QueryState::COMPLETE;
+		finished.has_chunk_count = true;
+		finished.chunk_count = 1;
+		codec.responses.push_back(finished);
+		QueryResponse metadata;
+		metadata.state = QueryState::COMPLETE;
+		metadata.metadata.push_back({"id", "varchar", false});
+		codec.responses.push_back(metadata);
+		QueryResponse bad;
+		bad.state = QueryState::COMPLETE;
+		bad.has_returned_rows = true;
+		bad.returned_rows = 1;
+		bad.chunk.rows.push_back({Cell("A"), Cell("extra")});
+		codec.responses.push_back(bad);
+		QueryApiV3Client client(transport, codec, runtime);
+		auto cursor = std::move(client.Prepare("select id from fixture",
+		                                      {"https://tenant.c360a.salesforce.com", "token"})).OpenCursor();
+		ResultChunk chunk;
+		bool rejected = false;
+		try { cursor.NextChunk(chunk); } catch (const std::runtime_error &) { rejected = true; }
+		Require(rejected && transport.requests.back().method == "DELETE",
+		        "row-width mismatch with matching returnedRows must reject before yielding and cancel");
+	}
+	{
+		FakeRuntime runtime;
+		RecordingTransport transport;
+		for (const auto *body : {"submitted", "finished", "metadata", "chunk", "delete"})
+			transport.responses.push_back({200, body});
+		ScriptedCodec codec;
+		QueryResponse submitted;
+		submitted.state = QueryState::RUNNING;
+		submitted.query_id = "query-total";
+		codec.responses.push_back(submitted);
+		QueryResponse finished;
+		finished.state = QueryState::COMPLETE;
+		finished.has_chunk_count = true;
+		finished.chunk_count = 1;
+		finished.has_row_count = true;
+		finished.row_count = 2;
+		codec.responses.push_back(finished);
+		QueryResponse metadata;
+		metadata.state = QueryState::COMPLETE;
+		metadata.metadata.push_back({"id", "varchar", false});
+		codec.responses.push_back(metadata);
+		QueryResponse rows;
+		rows.state = QueryState::COMPLETE;
+		rows.chunk.rows.push_back({Cell("A")});
+		codec.responses.push_back(rows);
+		QueryApiV3Client client(transport, codec, runtime);
+		auto cursor = std::move(client.Prepare("select id from fixture",
+		                                      {"https://tenant.c360a.salesforce.com", "token"})).OpenCursor();
+		ResultChunk chunk;
+		Require(cursor.NextChunk(chunk), "last nonempty chunk must be returned before final reconciliation");
+		bool rejected = false;
+		try { cursor.NextChunk(chunk); } catch (const std::runtime_error &) { rejected = true; }
+		Require(rejected && transport.requests.back().method == "DELETE",
+		        "advertised total mismatch must fail on finalization and cancel");
+	}
+}
+
+void TestCursorEnforcesCumulativeResponseBytesAndSchemaDrift() {
+	{
+		FakeRuntime runtime;
+		RecordingTransport transport;
+		for (const auto *body : {"aaaa", "bbbb", "cccc", "123456789", "delete"})
+			transport.responses.push_back({200, body});
+		ScriptedCodec codec;
+		QueryResponse submitted;
+		submitted.state = QueryState::RUNNING;
+		submitted.query_id = "query-bytes";
+		codec.responses.push_back(submitted);
+		QueryResponse finished;
+		finished.state = QueryState::COMPLETE;
+		finished.has_chunk_count = true;
+		finished.chunk_count = 1;
+		codec.responses.push_back(finished);
+		QueryResponse metadata;
+		metadata.state = QueryState::COMPLETE;
+		metadata.metadata.push_back({"id", "varchar", false});
+		codec.responses.push_back(metadata);
+		QueryResponse rows;
+		rows.state = QueryState::COMPLETE;
+		rows.chunk.rows.push_back({Cell("A")});
+		codec.responses.push_back(rows);
+		QueryOptions options;
+		options.max_total_response_bytes = 20;
+		QueryApiV3Client client(transport, codec, runtime, options);
+		auto cursor = std::move(client.Prepare("select id from fixture",
+		                                      {"https://tenant.c360a.salesforce.com", "token"})).OpenCursor();
+		ResultChunk chunk;
+		bool rejected = false;
+		try { cursor.NextChunk(chunk); } catch (const std::runtime_error &) { rejected = true; }
+		Require(rejected && transport.requests[3].max_response_bytes == 8 && transport.requests.back().method == "DELETE",
+		        "cumulative byte budget must shrink each chunk request and cancel on overflow");
+	}
+	{
+		FakeRuntime runtime;
+		RecordingTransport transport;
+		for (const auto *body : {"submitted", "finished", "metadata", "chunk", "delete"})
+			transport.responses.push_back({200, body});
+		ScriptedCodec codec;
+		QueryResponse submitted;
+		submitted.state = QueryState::RUNNING;
+		submitted.query_id = "query-drift";
+		codec.responses.push_back(submitted);
+		QueryResponse finished;
+		finished.state = QueryState::COMPLETE;
+		finished.has_chunk_count = true;
+		finished.chunk_count = 1;
+		codec.responses.push_back(finished);
+		QueryResponse metadata;
+		metadata.state = QueryState::COMPLETE;
+		metadata.metadata.push_back({"id", "varchar", false});
+		codec.responses.push_back(metadata);
+		QueryResponse drift;
+		drift.state = QueryState::COMPLETE;
+		drift.metadata.push_back({"renamed", "varchar", false});
+		drift.chunk.rows.push_back({Cell("A")});
+		codec.responses.push_back(drift);
+		QueryApiV3Client client(transport, codec, runtime);
+		auto cursor = std::move(client.Prepare("select id from fixture",
+		                                      {"https://tenant.c360a.salesforce.com", "token"})).OpenCursor();
+		ResultChunk chunk;
+		bool rejected = false;
+		try { cursor.NextChunk(chunk); } catch (const std::runtime_error &) { rejected = true; }
+		Require(rejected && transport.requests.back().method == "DELETE",
+		        "repeated metadata drift must reject before yielding and cancel");
+	}
+}
+
+void TestPrepareRejectsAdvertisedChunkLimitAndCursorRejectsCellLimit() {
+	{
+		FakeRuntime runtime;
+		RecordingTransport transport;
+		transport.responses.push_back({200, "submitted"});
+		transport.responses.push_back({200, "finished"});
+		transport.responses.push_back({204, ""});
+		ScriptedCodec codec;
+		QueryResponse submitted;
+		submitted.state = QueryState::RUNNING;
+		submitted.query_id = "query-too-many";
+		codec.responses.push_back(submitted);
+		QueryResponse finished;
+		finished.state = QueryState::COMPLETE;
+		finished.has_chunk_count = true;
+		finished.chunk_count = 2;
+		codec.responses.push_back(finished);
+		QueryOptions options;
+		options.max_chunks = 1;
+		QueryApiV3Client client(transport, codec, runtime, options);
+		bool rejected = false;
+		try { client.Prepare("select id from fixture", {"https://tenant.c360a.salesforce.com", "token"}); }
+		catch (const std::runtime_error &) { rejected = true; }
+		Require(rejected && transport.requests.size() == 3 && transport.requests[2].method == "DELETE",
+		        "advertised chunk limit must fail before metadata/chunk fetch and cancel");
+	}
+	{
+		FakeRuntime runtime;
+		RecordingTransport transport;
+		for (const auto *body : {"submitted", "finished", "metadata", "chunk", "delete"})
+			transport.responses.push_back({200, body});
+		ScriptedCodec codec;
+		QueryResponse submitted;
+		submitted.state = QueryState::RUNNING;
+		submitted.query_id = "query-cells";
+		codec.responses.push_back(submitted);
+		QueryResponse finished;
+		finished.state = QueryState::COMPLETE;
+		finished.has_chunk_count = true;
+		finished.chunk_count = 1;
+		codec.responses.push_back(finished);
+		QueryResponse metadata;
+		metadata.state = QueryState::COMPLETE;
+		metadata.metadata.push_back({"left", "varchar", false});
+		metadata.metadata.push_back({"right", "varchar", false});
+		codec.responses.push_back(metadata);
+		QueryResponse rows;
+		rows.state = QueryState::COMPLETE;
+		rows.chunk.rows.push_back({Cell("A"), Cell("B")});
+		codec.responses.push_back(rows);
+		QueryOptions options;
+		options.max_cells = 1;
+		QueryApiV3Client client(transport, codec, runtime, options);
+		auto cursor = std::move(client.Prepare("select left, right from fixture",
+		                                      {"https://tenant.c360a.salesforce.com", "token"})).OpenCursor();
+		ResultChunk chunk;
+		bool rejected = false;
+		try { cursor.NextChunk(chunk); } catch (const std::runtime_error &) { rejected = true; }
+		Require(rejected && transport.requests.back().method == "DELETE",
+		        "incremental cell overflow must reject before yielding and cancel");
+	}
+}
+
+void TestPreparedAndCursorDestructorsCancelExactlyOnce() {
+	for (const bool open_cursor : {false, true}) {
+		FakeRuntime runtime;
+		RecordingTransport transport;
+		transport.responses.push_back({200, "complete"});
+		transport.responses.push_back({204, ""});
+		ScriptedCodec codec;
+		QueryResponse complete;
+		complete.state = QueryState::COMPLETE;
+		complete.query_id = "query-abandon";
+		complete.metadata.push_back({"id", "varchar", false});
+		codec.responses.push_back(complete);
+		QueryApiV3Client client(transport, codec, runtime);
+		{
+			auto prepared = client.Prepare("select id from fixture",
+			                               {"https://tenant.c360a.salesforce.com", "token"});
+			if (open_cursor) {
+				auto cursor = std::move(prepared).OpenCursor();
+			}
+		}
+		Require(transport.requests.size() == 2 && transport.requests[1].method == "DELETE" &&
+		            transport.requests[1].cleanup_request && transport.requests[1].timeout_ms == 250,
+		        "abandoned prepared query or cursor must issue exactly one independently bounded DELETE");
+	}
 }
 
 void TestDefinesArrowReadyScalarMappings() {
@@ -776,9 +1367,16 @@ void TestDecodesLiveV3HeaderStatusAndCombinedChunks() {
 	    R"({"metadata":{"columns":[{"name":"flag","type":"bool","nullable":true}]},"data":[[true],[null]],"returnedRows":2})"};
 	auto chunk = codec.Decode(combined_chunk);
 	Require(chunk.state == QueryState::COMPLETE && chunk.chunk.rows.size() == 2,
-	        "row data must take precedence when a live chunk repeats metadata");
+	        "row data must decode when a live chunk repeats metadata");
+	Require(chunk.metadata.size() == 1 && chunk.metadata[0].name == "flag" && chunk.metadata[0].nullable,
+	        "live chunk must preserve repeated metadata for drift validation");
 	Require(chunk.chunk.rows[0][0] && *chunk.chunk.rows[0][0] == "true" && !chunk.chunk.rows[1][0],
 	        "live chunk scalars and nulls must decode exactly");
+
+	HttpResponse non_string_next {200, R"({"data":[],"next":123,"nextUrl":"/api/v3/query/ignored/chunks/1"})"};
+	auto bounded = codec.Decode(non_string_next);
+	Require(bounded.chunk.next_url.empty(),
+	        "direct pagination must accept only a string from the bounded provider 'next' field");
 }
 
 void TestBrokerSubprocessObservesCancellation() {
@@ -817,6 +1415,7 @@ int main() {
 	try {
 		TestPostsQueryWithoutCredentialsInBody();
 		TestEscapesEveryJsonControlCharacterInSql();
+		TestNumberedCursorFetchesOneChunkAtATime();
 		TestRealV3LifecycleFetchesMetadataAndNumberedChunks();
 		TestZeroRowV3StillFetchesSchema();
 		TestMetadataOnlyExecutionDoesNotFetchChunks();
@@ -827,6 +1426,17 @@ int main() {
 		TestRejectsUnsafeResponseDerivedUrls();
 		TestRejectsFailedChunkAndPaginationCycle();
 		TestCancellationStopsChunkTraversalBeforeNextRequest();
+		TestCancellationBetweenCursorCallsDeletesWithoutNextGet();
+		TestZeroChunkCursorFinalizesWithoutChunkGetOrDelete();
+		TestDirectCursorBuffersFirstChunkAndFetchesOneNextUrl();
+		TestConcreteCodecDirectCursorFetchesOneNextUrlPerCall();
+		TestRejectsQueryIdentityDriftAcrossLifecycle();
+		TestConcreteCodecRejectsMalformedAdvertisedCounts();
+		TestCursorReturnsAtMostOneNumberedChunkPerCall();
+		TestCursorAppliesIncrementalBoundsAndCountChecks();
+		TestCursorEnforcesCumulativeResponseBytesAndSchemaDrift();
+		TestPrepareRejectsAdvertisedChunkLimitAndCursorRejectsCellLimit();
+		TestPreparedAndCursorDestructorsCancelExactlyOnce();
 		TestDefinesArrowReadyScalarMappings();
 		TestRejectsDecimalMappingsOutsideDuckDbBounds();
 		TestRejectsUntrustedTenantUrlBeforeSendingToken();
