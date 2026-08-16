@@ -1,6 +1,8 @@
 .deps/
 duckdb
 extension-ci-tools
+vcpkg
+vcpkg_installed/
 build/
 build_release/
 build_debug/

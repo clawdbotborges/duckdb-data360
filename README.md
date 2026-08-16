@@ -24,19 +24,26 @@ Implemented and verified:
 - concrete TLS-verified HTTPS with redirects refused and bounded responses;
 - Query API V3 submission-ID recovery from Salesforce response headers;
 - metadata-driven DuckDB binding and one-chunk-at-a-time typed JSON-row vector output;
+- a bounded native Arrow IPC stream decoder and Arrow-to-DuckDB vector converter, verified against synthetic
+  multi-batch and empty streams;
 - live verification against the 32-row, 29-column synthetic Data 360 fixture.
 
 Not yet implemented:
 
-- native Arrow IPC decoding and Arrow-to-vector conversion;
+- Query API transport wiring and live parity for the native Arrow decoder; the live table-function path remains on
+  lazy JSON chunks;
 
 - provider precision/scale-driven decimal binding; the current `numeric` alias maps conservatively to `DECIMAL(38,18)`;
 - production Sowvi control-plane capability issuance (the current Python broker is development-local);
 - predicate/projection pushdown beyond SQL explicitly supplied to `data360_query`;
 - bounded retry/backoff for proven transient and idempotent operations.
 
-The native connector currently uses Query API JSON chunks. Arrow IPC access is independently proven by
-`../salesforce-data360-fixture/scripts/data360_oauth_smoke.py`, but must not be claimed as native-extension support.
+The live connector currently uses Query API JSON chunks. The extension now contains a native nanoarrow-based decoder
+and direct Arrow-to-DuckDB converter, but it is exercised only with deterministic synthetic IPC streams until transport
+wiring and live parity are complete. Arrow compression is intentionally disabled and compressed streams fail closed.
+The decoder requires an exact `application/vnd.apache.arrow.stream` media type, validates the independent stream schema,
+enforces a body cap before its owned input allocation, retains at most one record batch, emits vector-sized chunks, and
+rejects truncation and any bytes left after the protocol EOS marker with sanitized errors.
 DuckDB requires output names and types during binding. With no separate Data 360 describe endpoint currently wired,
 bind submits the read-only query and retrieves only its authoritative metadata; it does not download result chunks.
 Execution creates a fresh query during global scan initialization without downloading a result chunk. The single-threaded
@@ -71,8 +78,13 @@ The setup script pins DuckDB v1.5.5 and the extension build tooling by commit:
 ## Build
 
 ```bash
-make debug GEN=ninja
+make debug GEN=ninja \
+  VCPKG_TOOLCHAIN_PATH="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake"
 ```
+
+The manifest pins vcpkg baseline `94a541197763a4f449a1b91478df48c0584a6256`, nanoarrow `0.9.0` with its `ipc`
+feature, and transitive FlatCC `0.6.3`. The local `vcpkg/` checkout and build cache are development artifacts and are
+not source dependencies.
 
 On macOS, the Makefile disables DuckDB's debug ASan runtime because it deadlocks during initialization on macOS 26, and sets the explicit native DuckDB platform. Other platforms retain DuckDB's normal debug configuration.
 
@@ -89,6 +101,7 @@ build/debug/extension/data360/data360.duckdb_extension
 ctest --test-dir build/debug/extension/data360 --output-on-failure
 build/debug/extension/data360/data360_unit_tests
 build/debug/extension/data360/data360_scan_tests
+build/debug/extension/data360/data360_arrow_ipc_tests
 
 # DuckDB SQLLogic registration and fail-closed behavior
 build/debug/test/unittest test/sql/data360_query.test

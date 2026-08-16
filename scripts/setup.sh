@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DUCKDB_REV="d8cdaa33fda8df955cc76ef58a280f68f4cd43fa"
 EXTENSION_CI_TOOLS_REV="35759fd21acdb0ba8acbb3342a0b959dc46fefac"
+VCPKG_REV="94a541197763a4f449a1b91478df48c0584a6256"
 mkdir -p "$ROOT/.deps"
 
 setup_repo() {
@@ -37,5 +38,7 @@ setup_repo() {
 
 setup_repo duckdb https://github.com/duckdb/duckdb.git "$DUCKDB_REV"
 setup_repo extension-ci-tools https://github.com/duckdb/extension-ci-tools.git "$EXTENSION_CI_TOOLS_REV"
+setup_repo vcpkg https://github.com/microsoft/vcpkg.git "$VCPKG_REV"
 ln -sfn .deps/duckdb "$ROOT/duckdb"
 ln -sfn .deps/extension-ci-tools "$ROOT/extension-ci-tools"
+ln -sfn .deps/vcpkg "$ROOT/vcpkg"
