@@ -1,4 +1,4 @@
-# DuckDB Data 360 extension — read-only JSON connector
+# DuckDB Data 360 extension — read-only Arrow connector
 
 This directory contains the first native DuckDB extension slice for Salesforce Data 360 Query API V3.
 
@@ -10,7 +10,7 @@ Implemented and verified:
 - a read-only table-function registration, `data360_query(sql, secret_name)`;
 - fail-closed named-secret lookup (credentials are never accepted as SQL literals);
 - a transport-independent Query API V3 client contract;
-- asynchronous polling and lazy, incrementally bounded JSON-chunk traversal;
+- asynchronous polling and lazy, incrementally bounded result-chunk traversal;
 - canonical HTTPS-origin validation for exact `*.c360a.salesforce.com` DNS hosts;
 - request and overall timeouts;
 - best-effort remote `DELETE` with an independent 250 ms curl/process deadline when a local query is cancelled or
@@ -23,32 +23,31 @@ Implemented and verified:
 - a trusted process-local capability broker boundary;
 - concrete TLS-verified HTTPS with redirects refused and bounded responses;
 - Query API V3 submission-ID recovery from Salesforce response headers;
-- metadata-driven DuckDB binding and one-chunk-at-a-time typed JSON-row vector output;
+- authoritative precision/scale-driven DuckDB decimal binding;
+- native Arrow transport for numbered Query API V3 result chunks, with direct Arrow-to-DuckDB vector output;
+- lazy JSON fallback for the legacy direct-response shape;
 - a bounded native Arrow IPC stream decoder and Arrow-to-DuckDB vector converter, verified against synthetic
   multi-batch and empty streams;
 - live verification against the 32-row, 29-column synthetic Data 360 fixture.
 
 Not yet implemented:
 
-- Query API transport wiring and live parity for the native Arrow decoder; the live table-function path remains on
-  lazy JSON chunks;
-
-- provider precision/scale-driven decimal binding; the current `numeric` alias maps conservatively to `DECIMAL(38,18)`;
 - production Sowvi control-plane capability issuance (the current Python broker is development-local);
 - predicate/projection pushdown beyond SQL explicitly supplied to `data360_query`;
 - bounded retry/backoff for proven transient and idempotent operations.
 
-The live connector currently uses Query API JSON chunks. The extension now contains a native nanoarrow-based decoder
-and direct Arrow-to-DuckDB converter, but it is exercised only with deterministic synthetic IPC streams until transport
-wiring and live parity are complete. Arrow compression is intentionally disabled and compressed streams fail closed.
+The live numbered Query API V3 path requests native Arrow stream chunks and converts them directly into DuckDB vectors.
+The legacy direct-response shape retains its bounded lazy JSON fallback. Arrow compression is intentionally disabled and
+compressed streams fail closed.
 The decoder requires an exact `application/vnd.apache.arrow.stream` media type, validates the independent stream schema,
 enforces a body cap before its owned input allocation, retains at most one record batch, emits vector-sized chunks, and
-rejects truncation and any bytes left after the protocol EOS marker with sanitized errors.
+rejects truncation and trailing bytes with sanitized errors. A protocol EOS marker is accepted but not required: a clean
+end-of-body immediately after a complete IPC message is also valid, matching the live provider stream.
 DuckDB requires output names and types during binding. With no separate Data 360 describe endpoint currently wired,
 bind submits the read-only query and retrieves only its authoritative metadata; it does not download result chunks.
 Execution creates a fresh query during global scan initialization without downloading a result chunk. The single-threaded
-scan fetches and validates one non-empty bounded JSON chunk at a time, retaining only the current remote chunk while it
-fills DuckDB vectors.
+scan fetches and validates one bounded Arrow response at a time, retaining only that response and one decoded record batch
+while it fills DuckDB vectors. Legacy direct responses retain one bounded JSON chunk at a time.
 
 ## Security boundary
 

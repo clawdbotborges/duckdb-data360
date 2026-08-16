@@ -38,6 +38,10 @@ struct ColumnMetadata {
 	std::string name;
 	std::string type;
 	bool nullable;
+	bool has_precision = false;
+	bool has_scale = false;
+	uint8_t precision = 0;
+	uint8_t scale = 0;
 };
 
 struct ResultChunk {
@@ -128,6 +132,9 @@ public:
 	QueryCursor &operator=(const QueryCursor &) = delete;
 
 	bool NextChunk(ResultChunk &result);
+	bool IsNumberedV3() const;
+	bool NextArrowChunk(HttpResponse &response);
+	void ReportArrowChunk(uint64_t decoded_rows);
 
 private:
 	friend class PreparedQuery;

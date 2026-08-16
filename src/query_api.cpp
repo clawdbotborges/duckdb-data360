@@ -104,7 +104,9 @@ std::string JsonEscape(const std::string &value) {
 bool SameMetadata(const std::vector<ColumnMetadata> &left, const std::vector<ColumnMetadata> &right) {
 	if (left.size() != right.size()) return false;
 	for (size_t i = 0; i < left.size(); i++) {
-		if (left[i].name != right[i].name || left[i].type != right[i].type || left[i].nullable != right[i].nullable)
+		if (left[i].name != right[i].name || left[i].type != right[i].type || left[i].nullable != right[i].nullable ||
+		    left[i].has_precision != right[i].has_precision || left[i].has_scale != right[i].has_scale ||
+		    left[i].precision != right[i].precision || left[i].scale != right[i].scale)
 			return false;
 	}
 	return true;
@@ -137,6 +139,7 @@ struct Session {
 	uint64_t cells = 0;
 	bool reconciled = false;
 	bool terminal = false;
+	bool arrow_response_outstanding = false;
 
 	~Session() noexcept { Cancel(); }
 
@@ -147,6 +150,7 @@ struct Session {
 		cancellation.method = "DELETE";
 		cancellation.url = TrimTrailingSlash(credentials.instance_url) + "/api/v3/query/" + query_id;
 		cancellation.body.clear();
+		cancellation.headers["Accept"] = "application/json";
 		cancellation.timeout_ms = options.cleanup_timeout_ms;
 		cancellation.max_response_bytes = 64 * 1024;
 		cancellation.cleanup_request = true;
@@ -285,6 +289,8 @@ QueryCursor::~QueryCursor() noexcept = default;
 bool QueryCursor::NextChunk(ResultChunk &result) {
 	if (!state || !state->session) throw std::logic_error("Data 360 query cursor is not available");
 	auto &session = *state->session;
+	if (session.arrow_response_outstanding)
+		throw std::logic_error("Data 360 Arrow response must be reported before another cursor operation");
 	if (session.reconciled) return false;
 	if (session.terminal) throw std::logic_error("Data 360 query cursor is terminal");
 	try {
@@ -319,6 +325,66 @@ bool QueryCursor::NextChunk(ResultChunk &result) {
 			result = std::move(accepted);
 			return true;
 		}
+	} catch (...) {
+		session.Cancel();
+		throw;
+	}
+}
+
+bool QueryCursor::IsNumberedV3() const {
+	if (!state || !state->session) throw std::logic_error("Data 360 query cursor is not available");
+	return state->session->mode == QueryMode::NUMBERED_V3;
+}
+
+bool QueryCursor::NextArrowChunk(HttpResponse &response) {
+	if (!state || !state->session) throw std::logic_error("Data 360 query cursor is not available");
+	auto &session = *state->session;
+	if (session.mode != QueryMode::NUMBERED_V3)
+		throw std::logic_error("Data 360 Arrow cursor requires a numbered V3 query");
+	if (session.arrow_response_outstanding)
+		throw std::logic_error("Data 360 Arrow response must be reported before fetching another chunk");
+	if (session.reconciled) return false;
+	if (session.terminal) throw std::logic_error("Data 360 query cursor is terminal");
+	try {
+		session.CheckActive();
+		if (session.next_chunk_index >= session.expected_chunks) return session.Finish();
+		session.request.method = "GET";
+		session.request.body.clear();
+		session.request.headers["Accept"] = "application/vnd.apache.arrow.stream";
+		session.request.url = TrimTrailingSlash(session.credentials.instance_url) + "/api/v3/query/" + session.query_id +
+		                      "/chunks/" + std::to_string(session.next_chunk_index);
+		response = session.Send(session.request);
+		if (response.status < 200 || response.status >= 300)
+			throw std::runtime_error("Data 360 Query API chunk retrieval failed");
+		session.CheckActive();
+		session.arrow_response_outstanding = true;
+		return true;
+	} catch (...) {
+		session.Cancel();
+		throw;
+	}
+}
+
+void QueryCursor::ReportArrowChunk(uint64_t decoded_rows) {
+	if (!state || !state->session) throw std::logic_error("Data 360 query cursor is not available");
+	auto &session = *state->session;
+	if (!session.arrow_response_outstanding)
+		throw std::logic_error("Data 360 Arrow response row count was not expected");
+	try {
+		session.CheckActive();
+		const auto remaining_rows = session.options.max_rows - std::min(session.rows, session.options.max_rows);
+		const auto remaining_cells = session.options.max_cells - std::min(session.cells, session.options.max_cells);
+		if (decoded_rows > remaining_rows ||
+		    (session.metadata.size() != 0 && decoded_rows > remaining_cells / session.metadata.size()))
+			throw std::runtime_error("Data 360 Query API materialization limit exceeded");
+		if (session.has_expected_rows &&
+		    decoded_rows > session.expected_rows - std::min(session.rows, session.expected_rows))
+			throw std::runtime_error("Data 360 Query API row count mismatch");
+		session.rows += decoded_rows;
+		session.cells += decoded_rows * session.metadata.size();
+		session.fetched_chunks++;
+		session.next_chunk_index++;
+		session.arrow_response_outstanding = false;
 	} catch (...) {
 		session.Cancel();
 		throw;
@@ -403,6 +469,13 @@ PreparedQuery QueryApiV3Client::PrepareInternal(const std::string &sql, const Qu
 			if (metadata_response.state != QueryState::COMPLETE || metadata_response.metadata.empty())
 				throw std::runtime_error("Data 360 Query API metadata retrieval failed");
 			session->metadata = std::move(metadata_response.metadata);
+			for (const auto &column : session->metadata) {
+				std::string type = column.type;
+				std::transform(type.begin(), type.end(), type.begin(),
+				               [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+				if (type == "numeric" && (!column.has_precision || !column.has_scale))
+					throw std::runtime_error("Data 360 Query API numeric metadata was incomplete");
+			}
 		} else {
 			session->mode = QueryMode::DIRECT_LEGACY;
 			session->metadata = decoded.metadata;

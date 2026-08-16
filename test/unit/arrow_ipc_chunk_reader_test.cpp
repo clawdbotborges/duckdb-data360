@@ -111,11 +111,18 @@ void TestIndependentStreamsAndValidation() {
 	auto body = ReadFixture("synthetic_multi_batch.arrow");
 	ArrowIpcChunkReader first(*connection.context, ArrowIpcChunkReader::MediaType(), body, ExpectedSchema(), body.size());
 	ArrowIpcChunkReader second(*connection.context, ArrowIpcChunkReader::MediaType(), body, ExpectedSchema(), body.size());
+	ArrowIpcChunkReader parameterized(*connection.context,
+	                                  " application/vnd.apache.arrow.stream ; charset=binary", body,
+	                                  ExpectedSchema(), body.size());
 	DataChunk a, b;
 	Require(first.Next(a) && second.Next(b), "independent stream read failed");
+	DataChunk parameterized_chunk;
+	Require(parameterized.Next(parameterized_chunk), "legal media type parameter was rejected");
 	Require(a.GetValue(0, 0) == b.GetValue(0, 0), "independent streams interfered");
 
 	RequireInvalid(*connection.context, "application/json", body, ExpectedSchema(), body.size(), "media type accepted");
+	RequireInvalid(*connection.context, "application/vnd.apache.arrow.stream;;bad", body, ExpectedSchema(), body.size(),
+	               "malformed media type parameter accepted");
 	RequireInvalid(*connection.context, ArrowIpcChunkReader::MediaType(), body, ExpectedSchema(), body.size() - 1,
 	               "oversized body accepted");
 	RequireInvalid(*connection.context, ArrowIpcChunkReader::MediaType(), "not-arrow-provider-secret", ExpectedSchema(), 100,
@@ -151,6 +158,19 @@ void TestIndependentStreamsAndValidation() {
 	RequireInvalid(*connection.context, ArrowIpcChunkReader::MediaType(), body, drift, body.size(), "scale drift accepted");
 }
 
+void TestCleanEofWithoutOptionalStreamMarker() {
+	DuckDB database(nullptr);
+	Connection connection(database);
+	auto body = ReadFixture("synthetic_multi_batch.arrow");
+	Require(body.size() > 8, "fixture too small");
+	body.resize(body.size() - 8);
+	ArrowIpcChunkReader reader(*connection.context, ArrowIpcChunkReader::MediaType(), body, ExpectedSchema(), body.size());
+	DataChunk chunk;
+	idx_t rows = 0;
+	while (reader.Next(chunk)) rows += chunk.size();
+	Require(rows == 5000, "clean EOF without optional stream marker lost rows");
+}
+
 } // namespace
 
 int main() {
@@ -158,6 +178,7 @@ int main() {
 		TestSchemaAndVectorSizedOutput();
 		TestEmptySchemaPreservingStream();
 		TestIndependentStreamsAndValidation();
+		TestCleanEofWithoutOptionalStreamMarker();
 		std::cout << "Arrow IPC chunk reader tests passed\n";
 		return 0;
 	} catch (const std::exception &error) {

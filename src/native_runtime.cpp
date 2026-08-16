@@ -495,8 +495,31 @@ QueryResponse JsonQueryResponseCodec::Decode(const HttpResponse &response) {
 			auto nullable = yyjson_obj_get(column, "nullable");
 			if (!yyjson_is_str(name) || !yyjson_is_str(type) || !yyjson_is_bool(nullable))
 				throw std::runtime_error("Data 360 metadata column was incomplete");
-			result.metadata.push_back({std::string(yyjson_get_str(name), yyjson_get_len(name)),
-			                           std::string(yyjson_get_str(type), yyjson_get_len(type)), yyjson_get_bool(nullable)});
+			ColumnMetadata decoded {std::string(yyjson_get_str(name), yyjson_get_len(name)),
+			                        std::string(yyjson_get_str(type), yyjson_get_len(type)), yyjson_get_bool(nullable)};
+			auto precision_value = yyjson_obj_get(column, "precision");
+			auto scale_value = yyjson_obj_get(column, "scale");
+			const bool precision_present = precision_value != nullptr;
+			const bool scale_present = scale_value != nullptr;
+			std::string normalized_type = decoded.type;
+			std::transform(normalized_type.begin(), normalized_type.end(), normalized_type.begin(),
+			               [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+			if (normalized_type != "numeric" && (precision_present || scale_present))
+				throw std::runtime_error("Data 360 metadata column shape was unexpected");
+			if (precision_present != scale_present)
+				throw std::runtime_error("Data 360 numeric metadata shape was incomplete");
+			if (precision_present) {
+				uint64_t precision = 0;
+				uint64_t scale = 0;
+				if (!OptionalUnsigned(column, "precision", precision) || !OptionalUnsigned(column, "scale", scale) ||
+				    precision == 0 || precision > 38 || scale > precision)
+					throw std::runtime_error("Data 360 numeric metadata shape was invalid");
+				decoded.has_precision = true;
+				decoded.has_scale = true;
+				decoded.precision = static_cast<uint8_t>(precision);
+				decoded.scale = static_cast<uint8_t>(scale);
+			}
+			result.metadata.push_back(std::move(decoded));
 		}
 	}
 	if (auto data = yyjson_obj_get(root, "data"); yyjson_is_arr(data)) {

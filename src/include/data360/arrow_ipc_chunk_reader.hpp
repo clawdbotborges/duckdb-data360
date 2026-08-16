@@ -9,7 +9,7 @@
 
 namespace data360 {
 
-enum class ArrowFieldKind { INT64, UTF8, TIMESTAMP_US_UTC, DECIMAL128 };
+enum class ArrowFieldKind { BOOL, INT32, INT64, DOUBLE, UTF8, DATE32, DATE64, TIMESTAMP_US_UTC, DECIMAL128 };
 
 struct ExpectedArrowField {
 	std::string name;

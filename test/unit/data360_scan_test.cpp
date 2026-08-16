@@ -163,11 +163,15 @@ void TestBadConversionFailsWithColumnContext() {
 }
 
 void TestMetadataCompatibilityRejectsBindExecutionDrift() {
-	const std::vector<ColumnMetadata> bound {{"amount", "numeric", true}};
+	const std::vector<ColumnMetadata> bound {{"amount", "numeric", true, true, true, 18, 4}};
 	Require(MetadataCompatible(bound, bound), "identical execution metadata must remain compatible");
 	Require(!MetadataCompatible(bound, {{"renamed", "numeric", true}}), "column-name drift must be rejected");
 	Require(!MetadataCompatible(bound, {{"amount", "varchar", true}}), "column-type drift must be rejected");
 	Require(!MetadataCompatible(bound, {{"amount", "numeric", false}}), "nullability drift must be rejected");
+	Require(!MetadataCompatible(bound, {{"amount", "numeric", true, true, true, 19, 4}}),
+	        "decimal precision drift must be rejected");
+	Require(!MetadataCompatible(bound, {{"amount", "numeric", true, true, true, 18, 5}}),
+	        "decimal scale drift must be rejected");
 }
 
 void TestSourceDestructionCleansUpAfterEarlyStop() {

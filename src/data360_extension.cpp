@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "data360_extension.hpp"
+#include "data360/arrow_ipc_chunk_reader.hpp"
 #include "data360/native_runtime.hpp"
 #include "data360/scan_runtime.hpp"
 #include "data360/type_mapping.hpp"
@@ -16,6 +17,9 @@
 #include <cstdlib>
 #include <cstdio>
 #include <thread>
+#include <algorithm>
+#include <cctype>
+#include <limits>
 
 namespace duckdb {
 namespace {
@@ -72,6 +76,104 @@ private:
 	ClientContext &context;
 };
 
+std::string Lower(std::string value) {
+	std::transform(value.begin(), value.end(), value.begin(),
+	               [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+	return value;
+}
+
+std::vector<data360::ExpectedArrowField> ExpectedArrowSchema(
+    const std::vector<data360::ColumnMetadata> &metadata) {
+	std::vector<data360::ExpectedArrowField> expected;
+	for (const auto &column : metadata) {
+		data360::ExpectedArrowField field {column.name, data360::ArrowFieldKind::UTF8, column.nullable};
+		const auto type = Lower(column.type);
+		if (type == "bool" || type == "boolean") field.kind = data360::ArrowFieldKind::BOOL;
+		else if (type == "integer" || type == "int") field.kind = data360::ArrowFieldKind::INT32;
+		else if (type == "bigint") field.kind = data360::ArrowFieldKind::INT64;
+		else if (type == "double") field.kind = data360::ArrowFieldKind::DOUBLE;
+		else if (type == "varchar" || type == "string") field.kind = data360::ArrowFieldKind::UTF8;
+		else if (type == "date") field.kind = data360::ArrowFieldKind::DATE64;
+		else if (type == "timestamp" || type == "timestamptz" || type == "timestamp_with_time_zone")
+			field.kind = data360::ArrowFieldKind::TIMESTAMP_US_UTC;
+		else if (type == "numeric") {
+			if (!column.has_precision || !column.has_scale)
+				throw InvalidInputException("Data 360 numeric metadata was incomplete");
+			field.kind = data360::ArrowFieldKind::DECIMAL128;
+			field.precision = column.precision;
+			field.scale = column.scale;
+		} else {
+			throw InvalidInputException("Data 360 Arrow metadata contained an unsupported type");
+		}
+		expected.push_back(std::move(field));
+	}
+	return expected;
+}
+
+std::string ArrowContentType(const data360::HttpResponse &response) {
+	std::string result;
+	for (const auto &header : response.headers) {
+		if (Lower(header.first) != "content-type") continue;
+		if (!result.empty()) throw InvalidInputException("Data 360 Arrow response headers were invalid");
+		result = header.second;
+	}
+	if (result.empty()) throw InvalidInputException("Data 360 Arrow response headers were invalid");
+	return result;
+}
+
+class ArrowScanSource final {
+public:
+	ArrowScanSource(ClientContext &context_p, data360::QueryCursor cursor_p,
+	                const std::vector<data360::ColumnMetadata> &metadata,
+	                const vector<LogicalType> &bound_types)
+	    : context(context_p), cursor(std::move(cursor_p)), expected(ExpectedArrowSchema(metadata)), types(bound_types) {
+	}
+
+	bool Next(DataChunk &output) {
+		while (true) {
+			if (reader) {
+				if (reader->Next(output)) return true;
+				reader.reset();
+			}
+			if (!cursor.NextArrowChunk(response)) {
+				output.SetCardinality(0);
+				return false;
+			}
+
+			const auto content_type = ArrowContentType(response);
+			uint64_t validated_rows = 0;
+			{
+				data360::ArrowIpcChunkReader validator(context, content_type, response.body, expected,
+				                                              64ULL * 1024ULL * 1024ULL);
+				if (validator.Types() != types)
+					throw InvalidInputException("Data 360 Arrow result schema changed");
+				DataChunk discarded;
+				while (validator.Next(discarded)) {
+					if (validated_rows > std::numeric_limits<uint64_t>::max() - discarded.size())
+						throw InvalidInputException("Data 360 Arrow response exceeded configured limits");
+					validated_rows += discarded.size();
+				}
+			}
+
+			auto validated_reader = std::make_unique<data360::ArrowIpcChunkReader>(
+			    context, content_type, response.body, expected, 64ULL * 1024ULL * 1024ULL);
+			if (validated_reader->Types() != types)
+				throw InvalidInputException("Data 360 Arrow result schema changed");
+			cursor.ReportArrowChunk(validated_rows);
+			reader = std::move(validated_reader);
+			response = {};
+		}
+	}
+
+private:
+	ClientContext &context;
+	data360::QueryCursor cursor;
+	std::vector<data360::ExpectedArrowField> expected;
+	vector<LogicalType> types;
+	data360::HttpResponse response {};
+	std::unique_ptr<data360::ArrowIpcChunkReader> reader;
+};
+
 class Data360GlobalState final : public GlobalTableFunctionState {
 public:
 	explicit Data360GlobalState(ClientContext &context)
@@ -83,6 +185,7 @@ public:
 	data360::JsonQueryResponseCodec codec;
 	data360::QueryApiV3Client client;
 	std::unique_ptr<data360::ChunkSource> source;
+	std::unique_ptr<ArrowScanSource> arrow_source;
 	data360::ScanBuffer scan_buffer;
 };
 
@@ -160,7 +263,10 @@ unique_ptr<FunctionData> Data360QueryBind(ClientContext &context, TableFunctionB
 			if (column.name.empty()) {
 				throw BinderException("Data 360 query returned an unnamed column");
 			}
-			const auto mapping = data360::MapData360Type(column.type);
+			const auto mapping = (Lower(column.type) == "numeric" && column.has_precision && column.has_scale)
+			                         ? data360::MapData360Type("DECIMAL(" + std::to_string(column.precision) + "," +
+			                                                   std::to_string(column.scale) + ")")
+			                         : data360::MapData360Type(column.type);
 			auto logical_type = BindLogicalType(mapping);
 			names.push_back(column.name);
 			return_types.push_back(logical_type);
@@ -193,7 +299,12 @@ unique_ptr<GlobalTableFunctionState> Data360QueryInit(ClientContext &context, Ta
 		if (!data360::MetadataCompatible(bind.metadata, metadata)) {
 			throw InvalidInputException("Data 360 result schema changed after binding");
 		}
-		state->source = std::make_unique<data360::CursorChunkSource>(std::move(prepared).OpenCursor());
+		auto cursor = std::move(prepared).OpenCursor();
+		if (cursor.IsNumberedV3()) {
+			state->arrow_source = std::make_unique<ArrowScanSource>(context, std::move(cursor), metadata, bind.types);
+		} else {
+			state->source = std::make_unique<data360::CursorChunkSource>(std::move(cursor));
+		}
 		return std::move(state);
 	} catch (const InvalidInputException &) {
 		throw;
@@ -207,7 +318,11 @@ void Data360QueryFunction(ClientContext &context, TableFunctionInput &input, Dat
 	const auto &bind = input.bind_data->Cast<Data360BindData>();
 	auto &state = input.global_state->Cast<Data360GlobalState>();
 	try {
-		data360::FillDataChunk(*state.source, state.scan_buffer, bind.types, bind.names, output);
+		if (state.arrow_source) {
+			(void)state.arrow_source->Next(output);
+		} else {
+			data360::FillDataChunk(*state.source, state.scan_buffer, bind.types, bind.names, output);
+		}
 	} catch (const InvalidInputException &) {
 		throw;
 	} catch (...) {

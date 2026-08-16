@@ -19,7 +19,11 @@ bool MetadataCompatible(const std::vector<ColumnMetadata> &bound,
 	for (size_t column = 0; column < bound.size(); column++) {
 		if (bound[column].name != execution[column].name ||
 		    bound[column].type != execution[column].type ||
-		    bound[column].nullable != execution[column].nullable) {
+		    bound[column].nullable != execution[column].nullable ||
+		    bound[column].has_precision != execution[column].has_precision ||
+		    bound[column].has_scale != execution[column].has_scale ||
+		    bound[column].precision != execution[column].precision ||
+		    bound[column].scale != execution[column].scale) {
 			return false;
 		}
 	}

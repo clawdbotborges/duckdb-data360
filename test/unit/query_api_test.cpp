@@ -778,6 +778,75 @@ void TestConcreteCodecRejectsMalformedAdvertisedCounts() {
 	}
 }
 
+void TestConcreteCodecRequiresValidNumericShape() {
+	JsonQueryResponseCodec codec;
+	auto decoded = codec.Decode({200, R"({"metadata":{"columns":[{"name":"amount","type":"numeric","nullable":true,"precision":18,"scale":4}]}})"});
+	Require(decoded.metadata.size() == 1 && decoded.metadata[0].has_precision && decoded.metadata[0].precision == 18 &&
+	            decoded.metadata[0].has_scale && decoded.metadata[0].scale == 4,
+	        "numeric precision and scale must be preserved authoritatively");
+	for (const auto *body : {
+	         R"({"metadata":{"columns":[{"name":"amount","type":"numeric","nullable":true,"precision":18}]}})",
+	         R"({"metadata":{"columns":[{"name":"amount","type":"numeric","nullable":true,"precision":"18","scale":4}]}})",
+	         R"({"metadata":{"columns":[{"name":"amount","type":"numeric","nullable":true,"precision":39,"scale":4}]}})",
+	         R"({"metadata":{"columns":[{"name":"amount","type":"numeric","nullable":true,"precision":18,"scale":19}]}})",
+	         R"({"metadata":{"columns":[{"name":"id","type":"bigint","nullable":false,"precision":18,"scale":0}]}})"}) {
+		bool rejected = false;
+		try { (void)codec.Decode({200, body}); } catch (const std::runtime_error &) { rejected = true; }
+		Require(rejected, "malformed or unexpected decimal shape must fail closed");
+	}
+}
+
+void TestArrowCursorScopesAcceptAndRequiresOneReport() {
+	FakeRuntime runtime;
+	RecordingTransport transport;
+	for (const auto *body : {"submitted", "finished", "metadata", "arrow-zero", "arrow-one"})
+		transport.responses.push_back({200, body, {{"Content-Type", "application/vnd.apache.arrow.stream"}}});
+	ScriptedCodec codec;
+	QueryResponse submitted;
+	submitted.state = QueryState::RUNNING;
+	submitted.query_id = "query-arrow";
+	codec.responses.push_back(submitted);
+	QueryResponse finished;
+	finished.state = QueryState::COMPLETE;
+	finished.has_chunk_count = true;
+	finished.chunk_count = 2;
+	finished.has_row_count = true;
+	finished.row_count = 1;
+	codec.responses.push_back(finished);
+	QueryResponse metadata;
+	metadata.state = QueryState::COMPLETE;
+	metadata.metadata.push_back({"amount", "numeric", true, true, true, 18, 4});
+	codec.responses.push_back(metadata);
+	QueryApiV3Client client(transport, codec, runtime);
+	auto cursor = std::move(client.Prepare("select amount from fixture",
+	                                      {"https://tenant.c360a.salesforce.com", "token"})).OpenCursor();
+	Require(cursor.IsNumberedV3(), "completed numbered query must expose Arrow mode");
+	HttpResponse response;
+	Require(cursor.NextArrowChunk(response) && response.body == "arrow-zero",
+	        "first raw Arrow response must remain process-local");
+	Require(transport.requests.size() == 4 &&
+	            transport.requests.back().headers.at("Accept") == "application/vnd.apache.arrow.stream",
+	        "only numbered chunk GET must request Arrow");
+	for (size_t index = 0; index < 3; index++) {
+		Require(transport.requests[index].headers.at("Accept") == "application/json",
+		        "submit, poll, and metadata must remain JSON");
+	}
+	bool outstanding_rejected = false;
+	try { cursor.NextArrowChunk(response); } catch (const std::logic_error &) { outstanding_rejected = true; }
+	Require(outstanding_rejected && transport.requests.size() == 4,
+	        "next GET must not occur before the prior response is reported");
+	bool mixed_cursor_rejected = false;
+	ResultChunk json_chunk;
+	try { cursor.NextChunk(json_chunk); } catch (const std::logic_error &) { mixed_cursor_rejected = true; }
+	Require(mixed_cursor_rejected && transport.requests.size() == 4,
+	        "JSON cursor path must not bypass an outstanding Arrow response");
+	cursor.ReportArrowChunk(0);
+	Require(cursor.NextArrowChunk(response) && transport.requests.size() == 5,
+	        "empty Arrow chunk must reconcile exactly once before next GET");
+	cursor.ReportArrowChunk(1);
+	Require(!cursor.NextArrowChunk(response), "reported rows and chunks must reconcile at EOS");
+}
+
 void TestCursorReturnsAtMostOneNumberedChunkPerCall() {
 	FakeRuntime runtime;
 	RecordingTransport transport;
@@ -1432,6 +1501,8 @@ int main() {
 		TestConcreteCodecDirectCursorFetchesOneNextUrlPerCall();
 		TestRejectsQueryIdentityDriftAcrossLifecycle();
 		TestConcreteCodecRejectsMalformedAdvertisedCounts();
+		TestConcreteCodecRequiresValidNumericShape();
+		TestArrowCursorScopesAcceptAndRequiresOneReport();
 		TestCursorReturnsAtMostOneNumberedChunkPerCall();
 		TestCursorAppliesIncrementalBoundsAndCountChecks();
 		TestCursorEnforcesCumulativeResponseBytesAndSchemaDrift();

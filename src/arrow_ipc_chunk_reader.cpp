@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cctype>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -18,18 +19,58 @@ namespace {
 
 constexpr const char *ARROW_MEDIA_TYPE = "application/vnd.apache.arrow.stream";
 constexpr const char *INVALID_ARROW_ERROR = "Data 360 Arrow IPC response is invalid";
-constexpr std::array<unsigned char, 8> STREAM_EOS = {0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
 
 [[noreturn]] void InvalidArrow() {
 	throw duckdb::InvalidInputException(INVALID_ARROW_ERROR);
 }
 
+bool IsTokenCharacter(unsigned char value) {
+	return std::isalnum(value) || value == '!' || value == '#' || value == '$' || value == '%' || value == '&' ||
+	       value == '\'' || value == '*' || value == '+' || value == '-' || value == '.' || value == '^' ||
+	       value == '_' || value == '`' || value == '|' || value == '~';
+}
+
+bool IsArrowMediaType(const std::string &value) {
+	auto separator = value.find(';');
+	auto base = value.substr(0, separator);
+	while (!base.empty() && (base.front() == ' ' || base.front() == '	')) base.erase(0, 1);
+	while (!base.empty() && (base.back() == ' ' || base.back() == '	')) base.pop_back();
+	std::transform(base.begin(), base.end(), base.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	if (base != ARROW_MEDIA_TYPE) return false;
+	while (separator != std::string::npos) {
+		auto start = separator + 1;
+		auto end = value.find(';', start);
+		auto parameter = value.substr(start, end - start);
+		while (!parameter.empty() && (parameter.front() == ' ' || parameter.front() == '\t')) parameter.erase(0, 1);
+		while (!parameter.empty() && (parameter.back() == ' ' || parameter.back() == '\t')) parameter.pop_back();
+		auto equals = parameter.find('=');
+		if (equals == std::string::npos || equals == 0 || equals + 1 == parameter.size()) return false;
+		if (!std::all_of(parameter.begin(), parameter.begin() + equals,
+		                 [](unsigned char c) { return IsTokenCharacter(c); })) return false;
+		auto parameter_value = parameter.substr(equals + 1);
+		if (!std::all_of(parameter_value.begin(), parameter_value.end(),
+		                 [](unsigned char c) { return IsTokenCharacter(c); })) return false;
+		separator = end;
+	}
+	return true;
+}
+
 std::string ExpectedFormat(const ExpectedArrowField &field) {
 	switch (field.kind) {
+	case ArrowFieldKind::BOOL:
+		return "b";
+	case ArrowFieldKind::INT32:
+		return "i";
 	case ArrowFieldKind::INT64:
 		return "l";
+	case ArrowFieldKind::DOUBLE:
+		return "g";
 	case ArrowFieldKind::UTF8:
 		return "u";
+	case ArrowFieldKind::DATE32:
+		return "tdD";
+	case ArrowFieldKind::DATE64:
+		return "tdm";
 	case ArrowFieldKind::TIMESTAMP_US_UTC:
 		return "tsu:UTC";
 	case ArrowFieldKind::DECIMAL128:
@@ -38,10 +79,14 @@ std::string ExpectedFormat(const ExpectedArrowField &field) {
 	return "";
 }
 
-bool HasTerminalStreamEos(const std::string &body) {
-	return body.size() >= STREAM_EOS.size() &&
-	       std::equal(STREAM_EOS.begin(), STREAM_EOS.end(),
-	                  reinterpret_cast<const unsigned char *>(body.data() + body.size() - STREAM_EOS.size()));
+bool FormatMatches(const ExpectedArrowField &field, const char *actual) {
+	if (!actual) return false;
+	if (field.kind == ArrowFieldKind::TIMESTAMP_US_UTC) {
+		// Data 360 emits the canonical UTC zone as `Utc`; synthetic Arrow
+		// producers commonly emit `UTC`. No other timezone is accepted.
+		return std::strcmp(actual, "tsu:UTC") == 0 || std::strcmp(actual, "tsu:Utc") == 0;
+	}
+	return ExpectedFormat(field) == actual;
 }
 
 struct BodyInputState {
@@ -99,10 +144,8 @@ struct ArrowIpcChunkReader::Impl {
 	Impl(duckdb::ClientContext &context_p, const std::string &content_type, const std::string &body,
 	     std::vector<ExpectedArrowField> expected_p, uint64_t max_body_bytes)
 	    : context(context_p), expected(std::move(expected_p)) {
-		if (content_type != ARROW_MEDIA_TYPE || body.size() > max_body_bytes ||
-		    body.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max()) || !HasTerminalStreamEos(body)) {
-			InvalidArrow();
-		}
+		if (!IsArrowMediaType(content_type) || body.empty() || body.size() > max_body_bytes ||
+		    body.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) InvalidArrow();
 
 		ArrowIpcInputStream input {};
 		try {
@@ -153,10 +196,8 @@ struct ArrowIpcChunkReader::Impl {
 			auto *child = schema.children[index];
 			const auto &field = expected[index];
 			if (!child || !child->name || !child->format || field.name != child->name ||
-			    ExpectedFormat(field) != child->format ||
-			    ((child->flags & ARROW_FLAG_NULLABLE) != 0) != field.nullable) {
-				InvalidArrow();
-			}
+			    !FormatMatches(field, child->format) ||
+			    ((child->flags & ARROW_FLAG_NULLABLE) != 0) != field.nullable) InvalidArrow();
 			if (field.kind == ArrowFieldKind::DECIMAL128 &&
 			    (field.precision == 0 || field.precision > 38 || field.scale > field.precision)) {
 				InvalidArrow();
