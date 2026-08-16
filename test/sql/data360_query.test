@@ -1,0 +1,17 @@
+# name: test/sql/data360_query.test
+# description: data360 read-only table function registration
+# group: [sql]
+
+require data360
+
+query I
+SELECT function_type
+FROM duckdb_functions()
+WHERE function_name = 'data360_query';
+----
+table
+
+statement error
+SELECT * FROM data360_query('select 1', 'missing_secret');
+----
+Data 360 secret 'missing_secret' was not found

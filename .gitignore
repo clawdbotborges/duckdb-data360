@@ -1,0 +1,8 @@
+.deps/
+duckdb
+extension-ci-tools
+build/
+build_release/
+build_debug/
+*.duckdb_extension
+.DS_Store
