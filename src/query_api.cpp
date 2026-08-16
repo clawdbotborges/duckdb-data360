@@ -152,12 +152,22 @@ QueryApiV3Client::QueryApiV3Client(HttpTransport &transport_p, QueryResponseCode
     : transport(transport_p), codec(codec_p), runtime(runtime_p), options(options_p) {
 	if (options.request_timeout_ms == 0 || options.overall_timeout_ms == 0 || options.poll_interval_ms == 0 ||
 	    options.max_chunks == 0 || options.cleanup_timeout_ms == 0 || options.cleanup_timeout_ms > 1000 ||
-	    options.poll_interval_ms > options.overall_timeout_ms) {
+	    options.max_rows == 0 || options.max_rows > 100000 || options.max_columns == 0 || options.max_cells == 0 ||
+	    options.max_total_response_bytes == 0 || options.poll_interval_ms > options.overall_timeout_ms) {
 		throw std::invalid_argument("Data 360 query options are invalid");
 	}
 }
 
 QueryResult QueryApiV3Client::Execute(const std::string &sql, const QueryCredentials &credentials) {
+	return ExecuteInternal(sql, credentials, false);
+}
+
+QueryResult QueryApiV3Client::ExecuteMetadata(const std::string &sql, const QueryCredentials &credentials) {
+	return ExecuteInternal(sql, credentials, true);
+}
+
+QueryResult QueryApiV3Client::ExecuteInternal(const std::string &sql, const QueryCredentials &credentials,
+                                              bool metadata_only) {
 	if (runtime.IsCancelled()) {
 		throw std::runtime_error("Data 360 query cancelled");
 	}
@@ -175,10 +185,15 @@ QueryResult QueryApiV3Client::Execute(const std::string &sql, const QueryCredent
 	request.url = TrimTrailingSlash(credentials.instance_url) + "/api/v3/query";
 	request.headers["Authorization"] = "Bearer " + credentials.access_token;
 	request.headers["Content-Type"] = "application/json";
-	request.body = "{\"sql\":\"" + JsonEscape(sql) + "\"}";
+	request.headers["Accept"] = "application/json";
+	const auto requested_row_limit = metadata_only ? 1 : options.max_rows;
+	request.body = "{\"sql\":\"" + JsonEscape(sql) +
+	               "\",\"transferMode\":\"ASYNC\",\"settings\":{\"timezone\":\"Etc/UTC\",\"language\":\"en_US\"},"
+	               "\"queryRowLimit\":" + std::to_string(requested_row_limit) + "}";
 	request.timeout_ms = options.request_timeout_ms;
 
 	const auto started_at_ms = runtime.NowMs();
+	uint64_t total_response_bytes = 0;
 	auto send = [&](HttpRequest &outbound) {
 		const auto elapsed = runtime.NowMs() - started_at_ms;
 		if (elapsed >= options.overall_timeout_ms) {
@@ -194,6 +209,11 @@ QueryResult QueryApiV3Client::Execute(const std::string &sql, const QueryCredent
 		} catch (...) {
 			throw std::runtime_error("Data 360 transport failed");
 		}
+		if (response.body.size() > options.max_total_response_bytes -
+		                               std::min<uint64_t>(total_response_bytes, options.max_total_response_bytes)) {
+			throw std::runtime_error("Data 360 Query API cumulative response limit exceeded");
+		}
+		total_response_bytes += response.body.size();
 		return response;
 	};
 	auto decode = [&](const HttpResponse &response) {
@@ -201,6 +221,28 @@ QueryResult QueryApiV3Client::Execute(const std::string &sql, const QueryCredent
 			return codec.Decode(response);
 		} catch (...) {
 			throw std::runtime_error("Data 360 response decoding failed");
+		}
+	};
+	auto validate_result = [&](const QueryResult &result, bool has_expected_rows, uint64_t expected_rows) {
+		if (result.metadata.size() > options.max_columns) {
+			throw std::runtime_error("Data 360 Query API returned too many columns");
+		}
+		uint64_t rows = 0;
+		uint64_t cells = 0;
+		for (const auto &chunk : result.chunks) {
+			for (const auto &row : chunk.rows) {
+				if (row.size() != result.metadata.size()) {
+					throw std::runtime_error("Data 360 Query API returned an invalid row width");
+				}
+				if (++rows > options.max_rows || row.size() > options.max_cells -
+				                                      std::min<uint64_t>(cells, options.max_cells)) {
+					throw std::runtime_error("Data 360 Query API materialization limit exceeded");
+				}
+				cells += row.size();
+			}
+		}
+		if (has_expected_rows && rows != expected_rows) {
+			throw std::runtime_error("Data 360 Query API row count mismatch");
 		}
 	};
 	auto decoded = decode(send(request));
@@ -226,6 +268,7 @@ QueryResult QueryApiV3Client::Execute(const std::string &sql, const QueryCredent
 		cancellation.body.clear();
 		cancellation.timeout_ms = options.cleanup_timeout_ms;
 		cancellation.max_response_bytes = 64 * 1024;
+		cancellation.cleanup_request = true;
 		try {
 			transport.Send(cancellation);
 		} catch (...) {
@@ -280,8 +323,58 @@ QueryResult QueryApiV3Client::Execute(const std::string &sql, const QueryCredent
 	if (decoded.state != QueryState::COMPLETE) {
 		throw std::runtime_error("Data 360 Query API did not complete");
 	}
+	if (decoded.has_chunk_count || decoded.chunk_count > 0) {
+		if (!IsSafeQueryId(last_remote_query_id)) {
+			throw std::runtime_error("Data 360 Query API returned an invalid completed response");
+		}
+		const auto expected_chunks = decoded.chunk_count;
+		if (expected_chunks > options.max_chunks) {
+			best_effort_cancel(last_remote_query_id);
+			throw std::runtime_error("Data 360 Query API returned too many chunks");
+		}
+		QueryResult result;
+		request.method = "GET";
+		request.body.clear();
+		request.url = TrimTrailingSlash(credentials.instance_url) + "/api/v3/query/" + last_remote_query_id + "/metadata";
+		auto metadata_response = decode(send(request));
+		if (metadata_response.state != QueryState::COMPLETE || metadata_response.metadata.empty()) {
+			throw std::runtime_error("Data 360 Query API metadata retrieval failed");
+		}
+		result.metadata = std::move(metadata_response.metadata);
+		if (metadata_only) {
+			validate_result(result, false, 0);
+			return result;
+		}
+		for (uint64_t chunk_index = 0; chunk_index < expected_chunks; chunk_index++) {
+			if (runtime.IsCancelled() || runtime.NowMs() - started_at_ms >= options.overall_timeout_ms) {
+				best_effort_cancel(last_remote_query_id);
+				throw std::runtime_error(runtime.IsCancelled() ? "Data 360 query cancelled" : "Data 360 query timed out");
+			}
+			request.url = TrimTrailingSlash(credentials.instance_url) + "/api/v3/query/" + last_remote_query_id +
+			              "/chunks/" + std::to_string(chunk_index);
+			auto chunk_response = decode(send(request));
+			if (chunk_response.state != QueryState::COMPLETE) {
+				throw std::runtime_error("Data 360 Query API chunk retrieval failed");
+			}
+			if (chunk_response.has_returned_rows && chunk_response.returned_rows != chunk_response.chunk.rows.size()) {
+				throw std::runtime_error("Data 360 Query API chunk row count mismatch");
+			}
+			result.chunks.push_back(std::move(chunk_response.chunk));
+		}
+		validate_result(result, decoded.has_row_count, decoded.row_count);
+		return result;
+	}
 	QueryResult result;
+	const auto direct_has_expected_rows = decoded.has_row_count;
+	const auto direct_expected_rows = decoded.row_count;
+	if (decoded.has_returned_rows && decoded.returned_rows != decoded.chunk.rows.size()) {
+		throw std::runtime_error("Data 360 Query API chunk row count mismatch");
+	}
 	result.metadata = std::move(decoded.metadata);
+	if (metadata_only) {
+		validate_result(result, false, 0);
+		return result;
+	}
 	result.chunks.push_back(std::move(decoded.chunk));
 	std::unordered_set<std::string> visited_chunk_urls;
 	while (!result.chunks.back().next_url.empty()) {
@@ -297,6 +390,7 @@ QueryResult QueryApiV3Client::Execute(const std::string &sql, const QueryCredent
 			cancellation.body.clear();
 			cancellation.timeout_ms = options.cleanup_timeout_ms;
 			cancellation.max_response_bytes = 64 * 1024;
+			cancellation.cleanup_request = true;
 			try {
 				transport.Send(cancellation);
 			} catch (...) {
@@ -335,6 +429,9 @@ QueryResult QueryApiV3Client::Execute(const std::string &sql, const QueryCredent
 		if (chunk_response.state != QueryState::COMPLETE) {
 			throw std::runtime_error("Data 360 Query API chunk retrieval failed");
 		}
+		if (chunk_response.has_returned_rows && chunk_response.returned_rows != chunk_response.chunk.rows.size()) {
+			throw std::runtime_error("Data 360 Query API chunk row count mismatch");
+		}
 		if (runtime.IsCancelled()) {
 			cancel_remote();
 			throw std::runtime_error("Data 360 query cancelled");
@@ -345,6 +442,7 @@ QueryResult QueryApiV3Client::Execute(const std::string &sql, const QueryCredent
 		}
 		result.chunks.push_back(std::move(chunk_response.chunk));
 	}
+	validate_result(result, direct_has_expected_rows, direct_expected_rows);
 	return result;
 }
 

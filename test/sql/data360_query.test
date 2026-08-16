@@ -11,6 +11,38 @@ WHERE function_name = 'data360_query';
 ----
 table
 
+statement ok
+CREATE SECRET data360_test (
+    TYPE data360,
+    PROVIDER process,
+    LOGIN_URL 'https://org.my.salesforce.com'
+);
+
+query III
+SELECT name, type, provider
+FROM duckdb_secrets()
+WHERE name = 'data360_test';
+----
+data360_test	data360	process
+
+statement error
+CREATE PERSISTENT SECRET forbidden_data360 (
+    TYPE data360,
+    PROVIDER process,
+    LOGIN_URL 'https://org.my.salesforce.com'
+);
+----
+Data 360 process secrets must be temporary
+
+statement error
+CREATE SECRET executable_injection (
+    TYPE data360,
+    PROVIDER process,
+    BROKER_PATH '/tmp/attacker-controlled'
+);
+----
+Unknown parameter 'broker_path'
+
 statement error
 SELECT * FROM data360_query('select 1', 'missing_secret');
 ----

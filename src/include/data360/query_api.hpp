@@ -18,11 +18,13 @@ struct HttpRequest {
 	uint64_t timeout_ms;
 	bool follow_redirects = false;
 	uint64_t max_response_bytes = 64ULL * 1024ULL * 1024ULL;
+	bool cleanup_request = false;
 };
 
 struct HttpResponse {
 	int status;
 	std::string body;
+	std::map<std::string, std::string> headers = {};
 };
 
 class HttpTransport {
@@ -48,6 +50,12 @@ struct QueryResponse {
 	QueryState state = QueryState::RUNNING;
 	std::string query_id;
 	std::string safe_error_code;
+	uint64_t chunk_count = 0;
+	uint64_t row_count = 0;
+	bool has_chunk_count = false;
+	bool has_row_count = false;
+	uint64_t returned_rows = 0;
+	bool has_returned_rows = false;
 	std::vector<ColumnMetadata> metadata;
 	ResultChunk chunk;
 };
@@ -77,6 +85,10 @@ struct QueryOptions {
 	uint64_t poll_interval_ms = 250;
 	uint64_t max_chunks = 1024;
 	uint64_t cleanup_timeout_ms = 250;
+	uint64_t max_rows = 100000;
+	uint64_t max_columns = 4096;
+	uint64_t max_cells = 10000000;
+	uint64_t max_total_response_bytes = 256ULL * 1024ULL * 1024ULL;
 };
 
 struct QueryResult {
@@ -89,8 +101,10 @@ public:
 	QueryApiV3Client(HttpTransport &transport, QueryResponseCodec &codec, RuntimeHooks &runtime,
 	                 QueryOptions options = {});
 	QueryResult Execute(const std::string &sql, const QueryCredentials &credentials);
+	QueryResult ExecuteMetadata(const std::string &sql, const QueryCredentials &credentials);
 
 private:
+	QueryResult ExecuteInternal(const std::string &sql, const QueryCredentials &credentials, bool metadata_only);
 	HttpTransport &transport;
 	QueryResponseCodec &codec;
 	RuntimeHooks &runtime;

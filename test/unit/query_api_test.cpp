@@ -1,11 +1,16 @@
 #include "data360/query_api.hpp"
+#include "data360/native_runtime.hpp"
 #include "data360/type_mapping.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <deque>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
 
 using namespace data360;
 
@@ -124,6 +129,10 @@ void TestPostsQueryWithoutCredentialsInBody() {
 	Require(request.headers.at("Authorization") == "Bearer test-token", "missing bearer authorization");
 	Require(request.body.find("test-token") == std::string::npos, "credential leaked into request body");
 	Require(request.body.find("select account_id from accounts") != std::string::npos, "SQL missing from request body");
+	Require(request.body.find("\"transferMode\":\"ASYNC\"") != std::string::npos,
+	        "live Query API submission must request asynchronous transfer");
+	Require(request.body.find("\"queryRowLimit\":100000") != std::string::npos,
+	        "live Query API submission must request a bounded positive row limit");
 	Require(result.metadata.size() == 1 && result.chunks.size() == 1, "result metadata/chunk missing");
 }
 
@@ -142,6 +151,108 @@ void TestEscapesEveryJsonControlCharacterInSql() {
 	Require(body.find("\\f") != std::string::npos, "form feed must be JSON escaped");
 	Require(body.find("\\u0000") != std::string::npos, "NUL must be JSON escaped");
 	Require(body.find('\0') == std::string::npos, "raw NUL must not appear in JSON");
+}
+
+void TestRealV3LifecycleFetchesMetadataAndNumberedChunks() {
+	FakeRuntime runtime;
+	RecordingTransport transport;
+	transport.responses.push_back({200, R"({"queryId":"query-live"})"});
+	transport.responses.push_back({200, R"({"completionStatus":"FINISHED","chunkCount":1,"rowCount":1})"});
+	transport.responses.push_back({200, R"({"metadata":{"columns":[]}})"});
+	transport.responses.push_back({200, R"({"data":[["A-1"]],"returnedRows":1})"});
+
+	ScriptedCodec codec;
+	QueryResponse submitted;
+	submitted.state = QueryState::RUNNING;
+	submitted.query_id = "query-live";
+	codec.responses.push_back(submitted);
+	QueryResponse finished;
+	finished.state = QueryState::COMPLETE;
+	finished.chunk_count = 1;
+	codec.responses.push_back(finished);
+	QueryResponse metadata;
+	metadata.state = QueryState::COMPLETE;
+	metadata.metadata.push_back({"account_id", "varchar", false});
+	codec.responses.push_back(metadata);
+	QueryResponse rows;
+	rows.state = QueryState::COMPLETE;
+	rows.chunk.rows.push_back({Cell("A-1")});
+	codec.responses.push_back(rows);
+
+	QueryApiV3Client client(transport, codec, runtime);
+	auto result = client.Execute("select account_id from accounts",
+	                             {"https://tenant.c360a.salesforce.com", "test-token"});
+
+	Require(transport.requests.size() == 4, "real V3 lifecycle must fetch status, metadata, and chunk zero");
+	Require(transport.requests[2].url == "https://tenant.c360a.salesforce.com/api/v3/query/query-live/metadata",
+	        "metadata endpoint missing");
+	Require(transport.requests[3].url == "https://tenant.c360a.salesforce.com/api/v3/query/query-live/chunks/0",
+	        "numbered chunk endpoint missing");
+	Require(result.metadata.size() == 1 && result.chunks.size() == 1, "real V3 result was incomplete");
+	Require(result.chunks[0].rows[0][0].value() == "A-1", "real V3 row missing");
+}
+
+void TestZeroRowV3StillFetchesSchema() {
+	FakeRuntime runtime;
+	RecordingTransport transport;
+	transport.responses.push_back({200, "submitted"});
+	transport.responses.push_back({200, "finished"});
+	transport.responses.push_back({200, "metadata"});
+	ScriptedCodec codec;
+	QueryResponse submitted;
+	submitted.state = QueryState::RUNNING;
+	submitted.query_id = "query-empty";
+	codec.responses.push_back(submitted);
+	QueryResponse finished;
+	finished.state = QueryState::COMPLETE;
+	finished.query_id = "query-empty";
+	finished.has_chunk_count = true;
+	finished.has_row_count = true;
+	codec.responses.push_back(finished);
+	QueryResponse metadata;
+	metadata.state = QueryState::COMPLETE;
+	metadata.metadata.push_back({"account_id", "varchar", true});
+	codec.responses.push_back(metadata);
+	QueryApiV3Client client(transport, codec, runtime);
+	auto result = client.Execute("select account_id from empty_table",
+	                             {"https://tenant.c360a.salesforce.com", "token"});
+	Require(transport.requests.size() == 3 &&
+	            transport.requests[2].url == "https://tenant.c360a.salesforce.com/api/v3/query/query-empty/metadata",
+	        "zero-row V3 result must fetch metadata");
+	Require(result.metadata.size() == 1 && result.chunks.empty(), "zero-row V3 schema must be preserved without rows");
+}
+
+void TestMetadataOnlyExecutionDoesNotFetchChunks() {
+	FakeRuntime runtime;
+	RecordingTransport transport;
+	transport.responses.push_back({200, "submitted"});
+	transport.responses.push_back({200, "finished"});
+	transport.responses.push_back({200, "metadata"});
+	ScriptedCodec codec;
+	QueryResponse submitted;
+	submitted.state = QueryState::RUNNING;
+	submitted.query_id = "query-schema";
+	codec.responses.push_back(submitted);
+	QueryResponse finished;
+	finished.state = QueryState::COMPLETE;
+	finished.query_id = "query-schema";
+	finished.chunk_count = 2;
+	finished.has_chunk_count = true;
+	finished.row_count = 32;
+	finished.has_row_count = true;
+	codec.responses.push_back(finished);
+	QueryResponse metadata;
+	metadata.state = QueryState::COMPLETE;
+	metadata.metadata.push_back({"account_id", "varchar", true});
+	codec.responses.push_back(metadata);
+	QueryApiV3Client client(transport, codec, runtime);
+	auto result = client.ExecuteMetadata("select account_id from accounts",
+	                                     {"https://tenant.c360a.salesforce.com", "token"});
+	Require(transport.requests.size() == 3, "metadata-only execution must not fetch result chunks");
+	Require(transport.requests[0].body.find("\"queryRowLimit\":1") != std::string::npos,
+	        "metadata-only execution must request the minimum positive row limit");
+	Require(result.metadata.size() == 1 && result.chunks.empty(),
+	        "metadata-only execution must preserve schema without materializing rows");
 }
 
 void TestPollsAsyncQueryUntilComplete() {
@@ -171,6 +282,45 @@ void TestPollsAsyncQueryUntilComplete() {
 	Require(result.chunks[0].rows[0][0].value() == "32", "poll result missing");
 }
 
+void TestRejectsAdvertisedRowCountMismatch() {
+	FakeRuntime runtime;
+	RecordingTransport transport;
+	transport.responses.push_back({200, "submitted"});
+	transport.responses.push_back({200, "finished"});
+	transport.responses.push_back({200, "metadata"});
+	transport.responses.push_back({200, "chunk"});
+	ScriptedCodec codec;
+	QueryResponse submitted;
+	submitted.state = QueryState::RUNNING;
+	submitted.query_id = "query-count";
+	codec.responses.push_back(submitted);
+	QueryResponse finished;
+	finished.state = QueryState::COMPLETE;
+	finished.chunk_count = 1;
+	finished.row_count = 2;
+	finished.has_chunk_count = true;
+	finished.has_row_count = true;
+	codec.responses.push_back(finished);
+	QueryResponse metadata;
+	metadata.state = QueryState::COMPLETE;
+	metadata.metadata.push_back({"id", "varchar", false});
+	codec.responses.push_back(metadata);
+	QueryResponse chunk;
+	chunk.state = QueryState::COMPLETE;
+	chunk.has_returned_rows = true;
+	chunk.returned_rows = 1;
+	chunk.chunk.rows.push_back({Cell("only-row")});
+	codec.responses.push_back(chunk);
+	QueryApiV3Client client(transport, codec, runtime);
+	bool rejected = false;
+	try {
+		client.Execute("select id from fixture", {"https://tenant.c360a.salesforce.com", "token"});
+	} catch (const std::runtime_error &) {
+		rejected = true;
+	}
+	Require(rejected, "advertised total row count mismatch must be rejected");
+}
+
 void TestFetchesAllResultChunks() {
 	RecordingTransport transport;
 	transport.responses.push_back({200, "first"});
@@ -196,6 +346,52 @@ void TestFetchesAllResultChunks() {
 	        "unexpected chunk URL");
 	Require(result.chunks.size() == 2, "all chunks must be retained");
 	Require(result.chunks[1].rows[0][0].value() == "B", "second chunk missing");
+}
+
+void TestDirectResultsEnforceAggregateBoundsAndCounts() {
+	{
+		RecordingTransport transport;
+		transport.responses.push_back({200, "complete"});
+		ScriptedCodec codec;
+		QueryResponse complete;
+		complete.state = QueryState::COMPLETE;
+		complete.metadata.push_back({"id", "VARCHAR", false});
+		complete.chunk.rows.push_back({Cell("A")});
+		complete.chunk.rows.push_back({Cell("B")});
+		codec.responses.push_back(complete);
+		FakeRuntime runtime;
+		QueryOptions options;
+		options.max_rows = 1;
+		QueryApiV3Client client(transport, codec, runtime, options);
+		bool rejected = false;
+		try {
+			client.Execute("select id from fixture", {"https://tenant.c360a.salesforce.com", "token"});
+		} catch (const std::runtime_error &) {
+			rejected = true;
+		}
+		Require(rejected, "direct results must enforce aggregate row limits");
+	}
+	{
+		RecordingTransport transport;
+		transport.responses.push_back({200, "complete"});
+		ScriptedCodec codec;
+		QueryResponse complete;
+		complete.state = QueryState::COMPLETE;
+		complete.metadata.push_back({"id", "VARCHAR", false});
+		complete.chunk.rows.push_back({Cell("A")});
+		complete.has_returned_rows = true;
+		complete.returned_rows = 2;
+		codec.responses.push_back(complete);
+		FakeRuntime runtime;
+		QueryApiV3Client client(transport, codec, runtime);
+		bool rejected = false;
+		try {
+			client.Execute("select id from fixture", {"https://tenant.c360a.salesforce.com", "token"});
+		} catch (const std::runtime_error &) {
+			rejected = true;
+		}
+		Require(rejected, "direct results must reconcile returnedRows");
+	}
 }
 
 void TestRejectsUnsafeResponseDerivedUrls() {
@@ -312,6 +508,11 @@ void TestDefinesArrowReadyScalarMappings() {
 	Require(timestamp.arrow_format == "tsu:UTC", "timestamp Arrow C format missing");
 	const auto unknown = MapData360Type("FUTURE_TYPE");
 	Require(unknown.duckdb_type == "VARCHAR" && unknown.lossy, "unknown types must safely fall back to VARCHAR");
+	Require(MapData360Type("bool").duckdb_type == "BOOLEAN", "live bool metadata must bind BOOLEAN");
+	Require(MapData360Type("numeric").duckdb_type == "DECIMAL(38,18)",
+	        "live numeric metadata must bind its fixture decimal shape");
+	Require(MapData360Type("timestamptz").duckdb_type == "TIMESTAMPTZ",
+	        "live timestamptz metadata must retain timezone semantics");
 }
 
 void TestRejectsDecimalMappingsOutsideDuckDbBounds() {
@@ -383,6 +584,8 @@ void TestCancelsRemoteJobWhenLocalQueryIsCancelled() {
 	Require(transport.requests[1].method == "DELETE", "remote cancellation must use DELETE");
 	Require(transport.requests[1].url == "https://tenant.c360a.salesforce.com/api/v3/query/query-123",
 	        "unexpected remote cancellation URL");
+	Require(transport.requests[1].cleanup_request && transport.requests[1].timeout_ms == 250,
+	        "remote cancellation must use an independent exact cleanup budget");
 }
 
 void TestCancelsRemoteJobAtOverallTimeout() {
@@ -544,14 +747,83 @@ void TestRejectsInvalidQueryOptions() {
 	Require(rejected_poll, "poll interval above overall timeout must be rejected");
 }
 
+void TestPreservesExactUnquotedDecimalLexeme() {
+	JsonQueryResponseCodec codec;
+	HttpResponse response {200, R"({"data":[[12345678901234567890.123456789012345678]]})"};
+	auto decoded = codec.Decode(response);
+	Require(decoded.chunk.rows.size() == 1 && decoded.chunk.rows[0].size() == 1,
+	        "exact decimal row must decode");
+	Require(decoded.chunk.rows[0][0] &&
+	            *decoded.chunk.rows[0][0] == "12345678901234567890.123456789012345678",
+	        "unquoted decimal lexeme must be preserved exactly");
+}
+
+void TestDecodesLiveV3HeaderStatusAndCombinedChunks() {
+	JsonQueryResponseCodec codec;
+	HttpResponse submitted {200, "{}", {{"x-hyperdb-status", R"({"queryId":"query-header"})"}}};
+	auto submission = codec.Decode(submitted);
+	Require(submission.state == QueryState::RUNNING && submission.query_id == "query-header",
+	        "live submission query ID must be decoded from x-hyperdb-status");
+
+	HttpResponse finished {200,
+	                       R"({"queryId":"query-header","completionStatus":"FINISHED","chunkCount":1,"rowCount":2})"};
+	auto completion = codec.Decode(finished);
+	Require(completion.state == QueryState::COMPLETE && completion.chunk_count == 1 && completion.row_count == 2,
+	        "queryId in a finished poll must not mask completionStatus");
+
+	HttpResponse combined_chunk {
+	    200,
+	    R"({"metadata":{"columns":[{"name":"flag","type":"bool","nullable":true}]},"data":[[true],[null]],"returnedRows":2})"};
+	auto chunk = codec.Decode(combined_chunk);
+	Require(chunk.state == QueryState::COMPLETE && chunk.chunk.rows.size() == 2,
+	        "row data must take precedence when a live chunk repeats metadata");
+	Require(chunk.chunk.rows[0][0] && *chunk.chunk.rows[0][0] == "true" && !chunk.chunk.rows[1][0],
+	        "live chunk scalars and nulls must decode exactly");
+}
+
+void TestBrokerSubprocessObservesCancellation() {
+	char path[] = "/tmp/data360-cancel-broker-XXXXXX";
+	const auto fd = mkstemp(path);
+	Require(fd >= 0, "temporary cancellation broker creation failed");
+	const std::string script = "import time\ntime.sleep(30)\n";
+	Require(write(fd, script.data(), script.size()) == static_cast<ssize_t>(script.size()),
+	        "temporary cancellation broker write failed");
+	Require(fchmod(fd, 0700) == 0, "temporary cancellation broker permissions failed");
+	close(fd);
+	std::atomic<bool> cancelled {false};
+	SteadyRuntime runtime(&cancelled);
+	std::thread canceller([&]() {
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		cancelled.store(true);
+	});
+	const auto started = std::chrono::steady_clock::now();
+	bool rejected = false;
+	try {
+		ResolveProcessCapability(path, "https://org.my.salesforce.com", &runtime);
+	} catch (const std::exception &) {
+		rejected = true;
+	}
+	canceller.join();
+	unlink(path);
+	const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                         std::chrono::steady_clock::now() - started).count();
+	Require(rejected, "cancelled broker subprocess must fail closed");
+	Require(elapsed < 2000, "broker subprocess cancellation must be bounded");
+}
+
 } // namespace
 
 int main() {
 	try {
 		TestPostsQueryWithoutCredentialsInBody();
 		TestEscapesEveryJsonControlCharacterInSql();
+		TestRealV3LifecycleFetchesMetadataAndNumberedChunks();
+		TestZeroRowV3StillFetchesSchema();
+		TestMetadataOnlyExecutionDoesNotFetchChunks();
 		TestPollsAsyncQueryUntilComplete();
+		TestRejectsAdvertisedRowCountMismatch();
 		TestFetchesAllResultChunks();
+		TestDirectResultsEnforceAggregateBoundsAndCounts();
 		TestRejectsUnsafeResponseDerivedUrls();
 		TestRejectsFailedChunkAndPaginationCycle();
 		TestCancellationStopsChunkTraversalBeforeNextRequest();
@@ -565,6 +837,9 @@ int main() {
 		TestSanitizesTransportAndCodecFailures();
 		TestPollingFailuresPreserveCancellationAndBoundCleanup();
 		TestRejectsInvalidQueryOptions();
+		TestPreservesExactUnquotedDecimalLexeme();
+		TestDecodesLiveV3HeaderStatusAndCombinedChunks();
+		TestBrokerSubprocessObservesCancellation();
 		std::cout << "query_api_test: PASS\n";
 		return EXIT_SUCCESS;
 	} catch (const std::exception &error) {

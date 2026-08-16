@@ -23,14 +23,17 @@ TypeMapping MapData360Type(const std::string &data360_type) {
 		}
 		return {normalized, "d:" + decimal[1].str() + "," + decimal[2].str(), false};
 	}
-	if (normalized == "TIMESTAMP_WITH_TIME_ZONE" || normalized == "TIMESTAMP_TZ") {
+	if (normalized == "TIMESTAMP_WITH_TIME_ZONE" || normalized == "TIMESTAMP_TZ" || normalized == "TIMESTAMPTZ") {
 		return {"TIMESTAMPTZ", "tsu:UTC", false};
 	}
 	if (normalized == "TIMESTAMP" || normalized == "DATETIME") {
 		return {"TIMESTAMP", "tsu:", false};
 	}
-	if (normalized == "BOOLEAN") {
+	if (normalized == "BOOLEAN" || normalized == "BOOL") {
 		return {"BOOLEAN", "b", false};
+	}
+	if (normalized == "NUMERIC") {
+		return {"DECIMAL(38,18)", "d:38,18", false};
 	}
 	if (normalized == "INTEGER" || normalized == "INT") {
 		return {"INTEGER", "i", false};

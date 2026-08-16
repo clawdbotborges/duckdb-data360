@@ -11,6 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(src/include)
 set(EXTENSION_SOURCES
     src/data360_extension.cpp
+    src/native_runtime.cpp
     src/query_api.cpp
     src/type_mapping.cpp)
 
@@ -26,9 +27,11 @@ install(TARGETS ${EXTENSION_NAME}
 
 add_executable(data360_unit_tests
     test/unit/query_api_test.cpp
+    src/native_runtime.cpp
     src/query_api.cpp
     src/type_mapping.cpp)
 target_include_directories(data360_unit_tests PRIVATE src/include)
 target_compile_features(data360_unit_tests PRIVATE cxx_std_17)
 target_compile_options(data360_unit_tests PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(data360_unit_tests PRIVATE duckdb)
 add_test(NAME data360_unit_tests COMMAND data360_unit_tests)
