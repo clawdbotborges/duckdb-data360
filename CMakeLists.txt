@@ -101,7 +101,7 @@ add_executable(data360_auth_core_tests
     src/oauth_pkce.cpp)
 target_include_directories(data360_auth_core_tests PRIVATE src/include)
 target_compile_features(data360_auth_core_tests PRIVATE cxx_std_17)
-target_compile_options(data360_auth_core_tests PRIVATE -Wall -Wextra -Werror)
+target_compile_options(data360_auth_core_tests PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
 target_link_libraries(data360_auth_core_tests PRIVATE ${DATA360_PLATFORM_LIBS})
 add_test(NAME data360_auth_core_tests COMMAND data360_auth_core_tests)
 
@@ -111,7 +111,7 @@ add_executable(data360_loopback_listener_tests
     src/oauth_pkce.cpp)
 target_include_directories(data360_loopback_listener_tests PRIVATE src/include)
 target_compile_features(data360_loopback_listener_tests PRIVATE cxx_std_17)
-target_compile_options(data360_loopback_listener_tests PRIVATE -Wall -Wextra -Werror)
+target_compile_options(data360_loopback_listener_tests PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
 target_link_libraries(data360_loopback_listener_tests PRIVATE ${DATA360_PLATFORM_LIBS})
 add_test(NAME data360_loopback_listener_tests COMMAND data360_loopback_listener_tests)
 
@@ -131,7 +131,7 @@ add_executable(data360_error_codes_tests
     src/error_codes.cpp)
 target_include_directories(data360_error_codes_tests PRIVATE src/include)
 target_compile_features(data360_error_codes_tests PRIVATE cxx_std_17)
-target_compile_options(data360_error_codes_tests PRIVATE -Wall -Wextra -Werror)
+target_compile_options(data360_error_codes_tests PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
 add_test(NAME data360_error_codes_tests COMMAND data360_error_codes_tests)
 
 add_executable(data360_salesforce_oauth_provider_tests

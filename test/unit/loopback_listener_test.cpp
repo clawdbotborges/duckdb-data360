@@ -336,7 +336,7 @@ void TestNativeCancelDuringReadDoesNotReuseDescriptors() {
 #else
 	const auto sent = send(unrelated.inbound, sentinel.data(), sentinel.size(), 0);
 #endif
-	Require(sent == static_cast<decltype(sent)>(sentinel.size()), "could not send unrelated payload");
+	Require(sent >= 0 && static_cast<size_t>(sent) == sentinel.size(), "could not send unrelated payload");
 	WaitForNativeWorker(worker, started);
 	Require(result.load() == NativeWaitResult::CANCELLED,
 	        "closing native client did not report cancellation during read/select");
@@ -346,7 +346,7 @@ void TestNativeCancelDuringReadDoesNotReuseDescriptors() {
 #else
 	const auto received = recv(unrelated.outbound, buffer, sizeof(buffer), 0);
 #endif
-	Require(received == static_cast<decltype(received)>(sentinel.size()) &&
+	Require(received >= 0 && static_cast<size_t>(received) == sentinel.size() &&
 	            std::string(buffer, static_cast<size_t>(received)) == sentinel,
 	        "callback worker received payload from an unrelated reused descriptor");
 	CloseTestSocket(callback_client);
@@ -383,7 +383,7 @@ void TestNativeResponseToNonReadingClientIsBounded() {
 #else
 	const auto request_sent = send(callback_client, request.data(), request.size(), 0);
 #endif
-	Require(request_sent == static_cast<decltype(request_sent)>(request.size()),
+	Require(request_sent >= 0 && static_cast<size_t>(request_sent) == request.size(),
 	        "could not send callback request for response test");
 	Require(acceptor->AcceptOne(8192, 1000, [] { return false; }) == request,
 	        "native listener did not receive callback request for response test");
