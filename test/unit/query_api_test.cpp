@@ -230,7 +230,11 @@ void TestPostsQueryWithoutCredentialsInBody() {
 	complete.chunk.rows.push_back({Cell("A-1")});
 	codec.responses.push_back(complete);
 	FakeRuntime runtime;
-	QueryApiV3Client client(transport, codec, runtime, {.request_timeout_ms = 5000, .overall_timeout_ms = 30000, .poll_interval_ms = 10});
+	QueryOptions options;
+	options.request_timeout_ms = 5000;
+	options.overall_timeout_ms = 30000;
+	options.poll_interval_ms = 10;
+	QueryApiV3Client client(transport, codec, runtime, options);
 
 	auto result = client.Execute("select account_id from accounts", {"https://tenant.c360a.salesforce.com/", "test-token"});
 
