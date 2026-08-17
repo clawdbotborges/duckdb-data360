@@ -10,8 +10,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(nanoarrow CONFIG REQUIRED)
 find_package(CURL CONFIG REQUIRED)
+find_package(Threads REQUIRED)
 
-set(DATA360_PLATFORM_LIBS duckdb_mbedtls duckdb_yyjson)
+set(DATA360_PLATFORM_LIBS duckdb_mbedtls duckdb_yyjson Threads::Threads)
 if(APPLE)
     find_library(DATA360_SECURITY_FRAMEWORK Security REQUIRED)
     list(APPEND DATA360_PLATFORM_LIBS ${DATA360_SECURITY_FRAMEWORK})
