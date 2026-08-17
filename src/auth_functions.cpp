@@ -181,7 +181,7 @@ unique_ptr<FunctionData> AuthStartBind(ClientContext &, TableFunctionBindInput &
 	bind->secret_name = RequiredString(input, 2);
 	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP_TZ, LogicalType::VARCHAR, LogicalType::VARCHAR};
 	names = {"auth_id", "authorization_url", "expires_at", "callback_url", "status"};
-	return std::move(bind);
+	return bind;
 }
 
 unique_ptr<FunctionData> AuthIdBind(ClientContext &, TableFunctionBindInput &input,
@@ -190,7 +190,7 @@ unique_ptr<FunctionData> AuthIdBind(ClientContext &, TableFunctionBindInput &inp
 	bind->auth_id = RequiredString(input, 0);
 	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP_TZ, LogicalType::VARCHAR, LogicalType::VARCHAR};
 	names = {"auth_id", "status", "expires_at", "error_code", "message"};
-	return std::move(bind);
+	return bind;
 }
 
 unique_ptr<FunctionData> AuthCompleteBind(ClientContext &, TableFunctionBindInput &input,
@@ -199,7 +199,7 @@ unique_ptr<FunctionData> AuthCompleteBind(ClientContext &, TableFunctionBindInpu
 	bind->auth_id = RequiredString(input, 0);
 	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP_TZ, LogicalType::VARCHAR, LogicalType::VARCHAR};
 	names = {"status", "secret_name", "expires_at", "error_code", "message"};
-	return std::move(bind);
+	return bind;
 }
 
 void EmitStatus(DataChunk &out, const data360::AuthStatusRow &row) {

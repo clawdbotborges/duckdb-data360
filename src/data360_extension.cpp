@@ -248,7 +248,7 @@ unique_ptr<FunctionData> Data360QueryBind(ClientContext &context, TableFunctionB
 			bind->names.push_back(column.name);
 			bind->metadata.push_back(column);
 		}
-		return std::move(bind);
+		return bind;
 	} catch (const data360::ReauthRequiredException &) {
 		throw BinderException(data360::FormatSafeFault(data360::AuthFault::REAUTH_REQUIRED));
 	} catch (const BinderException &) {
@@ -281,7 +281,7 @@ unique_ptr<GlobalTableFunctionState> Data360QueryInit(ClientContext &context, Ta
 		} else {
 			state->source = std::make_unique<data360::CursorChunkSource>(std::move(cursor));
 		}
-		return std::move(state);
+		return state;
 	} catch (const data360::ReauthRequiredException &) {
 		throw InvalidInputException(data360::FormatSafeFault(data360::AuthFault::REAUTH_REQUIRED));
 	} catch (const InvalidInputException &) {
