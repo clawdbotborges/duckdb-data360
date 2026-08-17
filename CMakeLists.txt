@@ -60,7 +60,10 @@ target_link_libraries(${EXTENSION_NAME} nanoarrow::nanoarrow_ipc CURL::libcurl $
 target_link_libraries(${LOADABLE_EXTENSION_NAME} nanoarrow::nanoarrow_ipc CURL::libcurl ${DATA360_PLATFORM_LIBS})
 
 if(MSVC)
-    set(DATA360_STRICT_WARNING_FLAGS /W4 /WX /wd4100)
+    # DuckDB v1.5.5 headers trigger these diagnostics under MSVC /W4;
+    # keep /WX for project code while matching the narrow inherited-header
+    # suppression used by the GCC/Clang path.
+    set(DATA360_STRICT_WARNING_FLAGS /W4 /WX /wd4100 /wd4146 /wd4458)
 else()
     set(DATA360_STRICT_WARNING_FLAGS -Wall -Wextra -Werror -Wno-unused-parameter)
 endif()
