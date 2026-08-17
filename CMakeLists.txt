@@ -82,7 +82,7 @@ add_executable(data360_unit_tests
 target_include_directories(data360_unit_tests PRIVATE src/include)
 target_compile_features(data360_unit_tests PRIVATE cxx_std_17)
 target_compile_options(data360_unit_tests PRIVATE ${DATA360_STRICT_WARNING_FLAGS})
-target_link_libraries(data360_unit_tests PRIVATE duckdb CURL::libcurl)
+target_link_libraries(data360_unit_tests PRIVATE duckdb_static dummy_static_extension_loader CURL::libcurl)
 add_test(NAME data360_unit_tests COMMAND data360_unit_tests)
 
 add_executable(data360_scan_tests
@@ -92,7 +92,7 @@ add_executable(data360_scan_tests
 target_include_directories(data360_scan_tests PRIVATE src/include)
 target_compile_features(data360_scan_tests PRIVATE cxx_std_17)
 target_compile_options(data360_scan_tests PRIVATE ${DATA360_STRICT_WARNING_FLAGS})
-target_link_libraries(data360_scan_tests PRIVATE duckdb)
+target_link_libraries(data360_scan_tests PRIVATE duckdb_static dummy_static_extension_loader)
 add_test(NAME data360_scan_tests COMMAND data360_scan_tests)
 
 add_executable(data360_arrow_ipc_tests
@@ -103,7 +103,7 @@ target_compile_features(data360_arrow_ipc_tests PRIVATE cxx_std_17)
 target_compile_options(data360_arrow_ipc_tests PRIVATE ${DATA360_STRICT_WARNING_FLAGS})
 target_compile_definitions(data360_arrow_ipc_tests PRIVATE
     DATA360_ARROW_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
-target_link_libraries(data360_arrow_ipc_tests PRIVATE duckdb nanoarrow::nanoarrow_ipc)
+target_link_libraries(data360_arrow_ipc_tests PRIVATE duckdb_static dummy_static_extension_loader nanoarrow::nanoarrow_ipc)
 add_test(NAME data360_arrow_ipc_tests COMMAND data360_arrow_ipc_tests)
 
 add_executable(data360_auth_core_tests
@@ -133,7 +133,7 @@ add_executable(data360_auth_session_registry_tests
 target_include_directories(data360_auth_session_registry_tests PRIVATE src/include)
 target_compile_features(data360_auth_session_registry_tests PRIVATE cxx_std_17)
 target_compile_options(data360_auth_session_registry_tests PRIVATE ${DATA360_STRICT_WARNING_FLAGS})
-target_link_libraries(data360_auth_session_registry_tests PRIVATE duckdb ${DATA360_PLATFORM_LIBS})
+target_link_libraries(data360_auth_session_registry_tests PRIVATE duckdb_static dummy_static_extension_loader ${DATA360_PLATFORM_LIBS})
 add_test(NAME data360_auth_session_registry_tests COMMAND data360_auth_session_registry_tests)
 
 add_executable(data360_error_codes_tests
@@ -153,7 +153,7 @@ add_executable(data360_salesforce_oauth_provider_tests
 target_include_directories(data360_salesforce_oauth_provider_tests PRIVATE src/include)
 target_compile_features(data360_salesforce_oauth_provider_tests PRIVATE cxx_std_17)
 target_compile_options(data360_salesforce_oauth_provider_tests PRIVATE ${DATA360_STRICT_WARNING_FLAGS})
-target_link_libraries(data360_salesforce_oauth_provider_tests PRIVATE duckdb ${DATA360_PLATFORM_LIBS})
+target_link_libraries(data360_salesforce_oauth_provider_tests PRIVATE duckdb_static dummy_static_extension_loader ${DATA360_PLATFORM_LIBS})
 add_test(NAME data360_salesforce_oauth_provider_tests COMMAND data360_salesforce_oauth_provider_tests)
 
 add_executable(data360_session_credentials_tests
@@ -165,7 +165,8 @@ add_executable(data360_session_credentials_tests
 target_include_directories(data360_session_credentials_tests PRIVATE src/include)
 target_compile_features(data360_session_credentials_tests PRIVATE cxx_std_17)
 target_compile_options(data360_session_credentials_tests PRIVATE ${DATA360_STRICT_WARNING_FLAGS})
-target_link_libraries(data360_session_credentials_tests PRIVATE duckdb ${DATA360_PLATFORM_LIBS})
+target_link_libraries(data360_session_credentials_tests PRIVATE duckdb_static ${DATA360_PLATFORM_LIBS})
+link_extension_libraries(data360_session_credentials_tests PRIVATE)
 add_test(NAME data360_session_credentials_tests COMMAND data360_session_credentials_tests)
 
 add_executable(data360_auth_functions_tests
@@ -181,5 +182,5 @@ add_executable(data360_auth_functions_tests
 target_include_directories(data360_auth_functions_tests PRIVATE src/include)
 target_compile_features(data360_auth_functions_tests PRIVATE cxx_std_17)
 target_compile_options(data360_auth_functions_tests PRIVATE ${DATA360_STRICT_WARNING_FLAGS})
-target_link_libraries(data360_auth_functions_tests PRIVATE duckdb CURL::libcurl ${DATA360_PLATFORM_LIBS})
+target_link_libraries(data360_auth_functions_tests PRIVATE duckdb_static dummy_static_extension_loader CURL::libcurl ${DATA360_PLATFORM_LIBS})
 add_test(NAME data360_auth_functions_tests COMMAND data360_auth_functions_tests)
