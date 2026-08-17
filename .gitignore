@@ -1,6 +1,5 @@
 .deps/
-duckdb
-extension-ci-tools
+.cache/
 vcpkg
 vcpkg_installed/
 build/
