@@ -34,6 +34,7 @@ struct OAuthExchangeOptions {
 class SalesforceOAuthProvider {
 public:
 	SalesforceOAuthProvider(HttpTransport &transport, RuntimeHooks &runtime, OAuthExchangeOptions options = {});
+	Data360Capability Exchange(AuthCompletionMaterial material);
 	Data360Capability Exchange(const std::string &login_origin, const std::string &client_id,
 	                           AuthCompletionMaterial material);
 

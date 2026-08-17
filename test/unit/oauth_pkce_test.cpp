@@ -85,12 +85,12 @@ void TestEntropyFailureStopsGeneration() {
 void TestSalesforceAuthorizationUrlIsExactAndEncoded() {
 	const auto url = BuildSalesforceAuthorizationUrl(
 	    "https://acme--dev.sandbox.my.salesforce.com/", "client id/+", "challenge-_", "state-_",
-	    "http://127.0.0.1:8910/oauth/callback");
+	    "http://localhost:8910/oauth/callback");
 	Require(url ==
-	            "https://acme--dev.sandbox.my.salesforce.com/services/oauth2/authorize?response_type=code&client_id=client%20id%2F%2B&redirect_uri=http%3A%2F%2F127.0.0.1%3A8910%2Foauth%2Fcallback&scope=api%20cdp_query_api&code_challenge=challenge-_&code_challenge_method=S256&state=state-_",
+	            "https://acme--dev.sandbox.my.salesforce.com/services/oauth2/authorize?response_type=code&client_id=client%20id%2F%2B&redirect_uri=http%3A%2F%2Flocalhost%3A8910%2Foauth%2Fcallback&scope=api%20cdp_query_api&code_challenge=challenge-_&code_challenge_method=S256&state=state-_",
 	        "authorization URL must use exact endpoint, ordering, scopes, and percent encoding");
 	Require(BuildSalesforceAuthorizationUrl("https://login.salesforce.com", "id", "c", "s",
-	                                        "http://127.0.0.1:8910/oauth/callback")
+	                                        "http://localhost:8910/oauth/callback")
 	                .find("https://login.salesforce.com/services/oauth2/authorize?") == 0,
 	        "canonical Salesforce login origin must be accepted");
 }
@@ -104,7 +104,7 @@ void TestInvalidOriginsAndCallbackAreRejected() {
 		RequireThrows([&] { ValidateSalesforceLoginOrigin(origin); }, "invalid login origin was accepted");
 	}
 	RequireThrows(
-	    [&] { BuildSalesforceAuthorizationUrl("https://acme.my.salesforce.com", "id", "c", "s", "http://localhost:8910/oauth/callback"); },
+	    [&] { BuildSalesforceAuthorizationUrl("https://acme.my.salesforce.com", "id", "c", "s", "http://127.0.0.1:8910/oauth/callback"); },
 	    "non-exact callback must be rejected");
 }
 

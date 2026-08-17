@@ -41,14 +41,14 @@ Configure the application as follows:
 
 1. Enable OAuth Authorization Code flow.
 2. Require PKCE and permit S256 only.
-3. Register the callback **exactly** as `http://127.0.0.1:8910/oauth/callback`.
+3. Register the callback **exactly** as `http://localhost:8910/oauth/callback`.
 4. Treat the application as a public client: no client secret is supplied to DuckDB.
 5. Grant only `api` and `cdp_query_api` for community v1. Do not grant or request `refresh_token`/`offline_access`.
 6. Apply the organization's permitted-user/admin-approval policy.
 7. Ensure My Domain, SSO, and the users' Data 360 permissions are configured. Users need access to the queried Data 360 objects and Query API; OAuth approval does not grant data access by itself.
 8. Distribute the public client ID as non-secret application metadata. Never distribute a client secret.
 
-The callback is fixed because Salesforce callback matching is exact. The extension binds `127.0.0.1:8910` before returning an authorization URL and must not silently choose another, unregistered port.
+The callback is fixed because Salesforce callback matching is exact and Salesforce permits its native-app HTTP exception for `localhost`, not a numeric loopback callback. The extension still binds only `127.0.0.1:8910` before returning the `localhost` authorization URL, validates `Host: localhost:8910` exactly, and must not silently choose another address or port.
 
 ## Install and load
 

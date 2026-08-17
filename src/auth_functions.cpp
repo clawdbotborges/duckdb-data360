@@ -265,7 +265,7 @@ void AuthCompleteExecute(ClientContext &context, TableFunctionInput &input, Data
 			owns_completion = true;
 			ContextRuntime runtime(context); data360::LibcurlTransport transport(&runtime);
 			data360::SalesforceOAuthProvider provider(transport, runtime);
-			auto capability = provider.Exchange(material.login_origin, material.client_id, std::move(material));
+			auto capability = provider.Exchange(std::move(material));
 			credential_id = registry.StoreCredential(std::move(capability.tenant_url), std::move(capability.access_token),
 			                                         capability.expires_at_monotonic_ms);
 			InstallTemporarySessionSecret(context, registry, snapshot.secret_name, credential_id);

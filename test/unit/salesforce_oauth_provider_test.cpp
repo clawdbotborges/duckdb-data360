@@ -89,8 +89,8 @@ void TestExactTwoPostExchangeProducesMoveOnlyCapability() {
 	SalesforceOAuthProvider provider(transport, runtime, options);
 	const std::string verifier(43, 'v');
 
-	auto capability = provider.Exchange("https://login.salesforce.com/", "client +/id",
-	                                    AuthCompletionMaterial("code +/value", verifier));
+	auto capability = provider.Exchange(
+	    AuthCompletionMaterial("code +/value", verifier, "https://login.salesforce.com/", "client +/id"));
 
 	Require(transport.requests.size() == 2, "exchange must issue exactly two requests");
 	const auto &oauth = transport.requests[0];
@@ -99,7 +99,7 @@ void TestExactTwoPostExchangeProducesMoveOnlyCapability() {
 	Require(oauth.headers.size() == 2 && oauth.headers.at("Accept") == "application/json" &&
 	            oauth.headers.at("Content-Type") == "application/x-www-form-urlencoded",
 	        "Salesforce exchange headers are not exact");
-	Require(oauth.body == "grant_type=authorization_code&client_id=client%20%2B%2Fid&redirect_uri=http%3A%2F%2F127.0.0.1%3A8910%2Foauth%2Fcallback&code=code%20%2B%2Fvalue&code_verifier=" + verifier,
+	Require(oauth.body == "grant_type=authorization_code&client_id=client%20%2B%2Fid&redirect_uri=http%3A%2F%2Flocalhost%3A8910%2Foauth%2Fcallback&code=code%20%2B%2Fvalue&code_verifier=" + verifier,
 	        "Salesforce exchange form is not exact");
 	Require(oauth.body.find("client_secret") == std::string::npos, "public-client exchange included a secret");
 	Require(!oauth.follow_redirects && oauth.timeout_ms == 4321 && oauth.max_response_bytes == 64U * 1024U,
@@ -131,6 +131,19 @@ void TestFixtureCompatibleMinimalResponses() {
 	                                    AuthCompletionMaterial("code", std::string(43, 'v')));
 	Require(capability.access_token == "data360-token", "minimal fixture response was rejected");
 	Require(runtime.now_calls == 1, "expiry used more than one monotonic clock snapshot");
+}
+
+void TestNormalizesBareTrustedData360Hostname() {
+	RecordingTransport transport;
+	QueueValidSalesforce(transport);
+	transport.responses.push_back(
+	    {200, R"({"access_token":"data360-token","instance_url":"tenant.c360a.salesforce.com","token_type":"Bearer","expires_in":600})"});
+	FakeRuntime runtime;
+	SalesforceOAuthProvider provider(transport, runtime, TestOptions());
+	auto capability = provider.Exchange("https://login.salesforce.com", "client",
+	                                    AuthCompletionMaterial("code", std::string(43, 'v')));
+	Require(capability.tenant_url == "https://tenant.c360a.salesforce.com",
+	        "trusted bare Data 360 hostname was not normalized to HTTPS");
 }
 
 void TestRejectsMalformedDuplicateWrongTypeAndOversizedJson() {
@@ -178,7 +191,7 @@ void TestRejectsUntrustedOrigins() {
 		              "untrusted Salesforce instance origin was accepted");
 		Require(transport.requests.size() == 1, "untrusted Salesforce origin reached second exchange");
 	}
-	for (const auto &tenant : {"http://tenant.c360a.salesforce.com", "https://c360a.salesforce.com", "https://TENANT.c360a.salesforce.com", "https://tenant.c360a.salesforce.com:443", "https://tenant.c360a.salesforce.com/", "https://tenant.c360a.salesforce.com?x", "https://-tenant.c360a.salesforce.com"}) {
+	for (const auto &tenant : {"http://tenant.c360a.salesforce.com", "https://c360a.salesforce.com", "https://TENANT.c360a.salesforce.com", "https://tenant.c360a.salesforce.com:443", "https://tenant.c360a.salesforce.com/", "https://tenant.c360a.salesforce.com?x", "https://-tenant.c360a.salesforce.com", "evil.example", "tenant.c360a.salesforce.com.evil.example", "TENANT.c360a.salesforce.com", "tenant.c360a.salesforce.com:443", "tenant.c360a.salesforce.com/path", "tenant.c360a.salesforce.com@evil.example", "tenant.c360a.salesforce.com%2Fevil", "-tenant.c360a.salesforce.com"}) {
 		RecordingTransport transport;
 		QueueValidSalesforce(transport);
 		transport.responses.push_back({200, std::string("{\"access_token\":\"d360\",\"instance_url\":\"") + tenant + "\",\"token_type\":\"Bearer\"}"});
@@ -356,6 +369,7 @@ int main() {
 	try {
 		TestExactTwoPostExchangeProducesMoveOnlyCapability();
 		TestFixtureCompatibleMinimalResponses();
+		TestNormalizesBareTrustedData360Hostname();
 		TestRejectsMalformedDuplicateWrongTypeAndOversizedJson();
 		TestRejectsUntrustedOrigins();
 		TestStatusMappingCancellationExpiryAndRedaction();

@@ -208,7 +208,7 @@ bool ConstantTimeEquals(const std::string &left, const std::string &right) {
 }
 
 const std::string &FixedOAuthCallbackUrl() {
-	static const std::string url = "http://127.0.0.1:8910/oauth/callback";
+	static const std::string url = "http://localhost:8910/oauth/callback";
 	return url;
 }
 

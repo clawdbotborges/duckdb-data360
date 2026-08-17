@@ -88,7 +88,7 @@ public:
 
 void TestExactCallbackParsingAndSingleUseCode() {
 	auto result = ParseOAuthCallbackRequest(
-	    "GET /oauth/callback?code=abc%2D123&state=received HTTP/1.1\r\nHost: 127.0.0.1:8910\r\n\r\n");
+	    "GET /oauth/callback?code=abc%2D123&state=received HTTP/1.1\r\nHost: localhost:8910\r\n\r\n");
 	Require(result.Status() == CallbackStatus::CODE_RECEIVED, "valid callback was not accepted");
 	Require(result.State() == "received", "callback state was not returned for registry validation");
 	Require(result.TakeCode() == "abc-123", "authorization code decoding failed");
@@ -107,8 +107,14 @@ void TestMalformedCallbacksFailClosed() {
 	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\ntRaNsFeR-EnCoDiNg: chunked\r\n\r\n",
 	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nMalformed\r\n\r\n",
 	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\n\r\n",
-	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost: localhost:8910\r\n\r\n",
-	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost: 127.0.0.1:8910\r\nhOsT: 127.0.0.1:8910\r\n\r\n",
+	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost: 127.0.0.1:8910\r\n\r\n",
+	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost: LOCALHOST:8910\r\n\r\n",
+	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost: localhost\r\n\r\n",
+	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost: localhost:80\r\n\r\n",
+	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost: localhost.:8910\r\n\r\n",
+	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost: localhost:8910.evil.example\r\n\r\n",
+	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost: localhost@evil:8910\r\n\r\n",
+	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost: localhost:8910\r\nhOsT: 127.0.0.1:8910\r\n\r\n",
 	         "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost : 127.0.0.1:8910\r\n\r\n",
 	         "GET /oauth/callback?code=a&state=s HTTP/1.0\r\n\r\n"}) {
 		RequireThrows([&] { ParseOAuthCallbackRequest(request); }, "malformed callback was accepted");
@@ -123,7 +129,7 @@ void TestMalformedCallbacksFailClosed() {
 
 void TestProviderDenialIsSanitized() {
 	auto result = ParseOAuthCallbackRequest(
-	    "GET /oauth/callback?error=access_denied&error_description=secret-provider-detail&state=s HTTP/1.1\r\nHost: 127.0.0.1:8910\r\n\r\n");
+	    "GET /oauth/callback?error=access_denied&error_description=secret-provider-detail&state=s HTTP/1.1\r\nHost: localhost:8910\r\n\r\n");
 	Require(result.Status() == CallbackStatus::ACCESS_DENIED, "denial callback did not map to denial");
 	Require(result.SafeErrorCode() == "USER_DENIED", "denial error was not sanitized");
 	Require(result.SafeErrorCode().find("secret") == std::string::npos, "provider description leaked");
@@ -132,7 +138,7 @@ void TestProviderDenialIsSanitized() {
 void TestListenerBindsBeforeWaitingAndAlwaysCloses() {
 	auto acceptor = std::make_unique<FakeAcceptor>();
 	auto *fake = acceptor.get();
-	fake->request = "GET /oauth/callback?code=abc&state=s HTTP/1.1\r\nHost: 127.0.0.1:8910\r\n\r\n";
+	fake->request = "GET /oauth/callback?code=abc&state=s HTTP/1.1\r\nHost: localhost:8910\r\n\r\n";
 	FixedLoopbackListener listener(std::move(acceptor));
 	Require(fake->bound, "listener constructor must bind before authorization URL can be returned");
 	auto result = listener.WaitForCallback(5000, [] { return false; });
@@ -377,7 +383,7 @@ void TestNativeResponseToNonReadingClientIsBounded() {
 	            connect(callback_client, reinterpret_cast<sockaddr *>(&endpoint), sizeof(endpoint)) == 0,
 	        "could not connect callback client for response test");
 	const std::string request =
-	    "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost: 127.0.0.1:8910\r\n\r\n";
+	    "GET /oauth/callback?code=a&state=s HTTP/1.1\r\nHost: localhost:8910\r\n\r\n";
 #ifdef _WIN32
 	const int request_sent = send(callback_client, request.data(), static_cast<int>(request.size()), 0);
 #else

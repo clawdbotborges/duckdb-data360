@@ -185,6 +185,12 @@ SalesforceOAuthProvider::SalesforceOAuthProvider(HttpTransport &transport_p, Run
 		throw AuthFaultException(AuthFault::DATA360_EXCHANGE_FAILED);
 }
 
+Data360Capability SalesforceOAuthProvider::Exchange(AuthCompletionMaterial material) {
+	const auto login_origin = material.login_origin;
+	const auto client_id = material.client_id;
+	return Exchange(login_origin, client_id, std::move(material));
+}
+
 Data360Capability SalesforceOAuthProvider::Exchange(const std::string &login_origin, const std::string &client_id,
                                                      AuthCompletionMaterial material) {
 	std::string origin;
@@ -260,7 +266,16 @@ Data360Capability SalesforceOAuthProvider::Exchange(const std::string &login_ori
 		throw;
 	}
 	SecureClear(data360_response.body);
-	if (!ValidDnsOrigin(parsed.tenant_url, ".c360a.salesforce.com") || parsed.ttl_seconds <= options.expiry_skew_seconds) {
+	if (parsed.tenant_url.rfind("https://", 0) != 0) {
+		const auto candidate = std::string("https://") + parsed.tenant_url;
+		if (!ValidDnsOrigin(candidate, ".c360a.salesforce.com")) {
+			SecureClear(parsed.token);
+			throw AuthFaultException(AuthFault::DATA360_EXCHANGE_FAILED);
+		}
+		parsed.tenant_url = candidate;
+	}
+	if (!ValidDnsOrigin(parsed.tenant_url, ".c360a.salesforce.com") ||
+	    parsed.ttl_seconds <= options.expiry_skew_seconds) {
 		SecureClear(parsed.token);
 		throw AuthFaultException(AuthFault::DATA360_EXCHANGE_FAILED);
 	}

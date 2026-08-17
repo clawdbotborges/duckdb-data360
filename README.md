@@ -143,6 +143,6 @@ FROM data360_query(
 );
 ```
 
-The callback is fixed at `http://127.0.0.1:8910/oauth/callback`. Authentication does not launch a browser or external
+The callback is fixed at `http://localhost:8910/oauth/callback`, while the listener binds only `127.0.0.1:8910`. Authentication does not launch a browser or external
 program. Persistent `data360` secrets and caller-created credential-bearing secrets are rejected. See
 [`docs/community-authentication.md`](docs/community-authentication.md) for the complete contract and setup requirements.

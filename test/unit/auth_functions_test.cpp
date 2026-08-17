@@ -136,7 +136,7 @@ void TestListenerThreadReportsStateMismatchAndMalformedCallback() {
 
 	auto mismatch_id = registry.Create("expected", "verifier", 10000, nullptr);
 	data360::FixedLoopbackListener mismatch_listener(std::make_unique<RequestAcceptor>(
-	    "GET /oauth/callback?code=secret-code&state=wrong HTTP/1.1\r\nHost: 127.0.0.1:8910\r\n\r\n"));
+	    "GET /oauth/callback?code=secret-code&state=wrong HTTP/1.1\r\nHost: localhost:8910\r\n\r\n"));
 	std::thread mismatch_worker([&] {
 		data360::ProcessAuthCallback(mismatch_listener, registry, mismatch_id, 5000, [] { return false; });
 	});
@@ -148,7 +148,7 @@ void TestListenerThreadReportsStateMismatchAndMalformedCallback() {
 
 	auto malformed_id = registry.Create("expected2", "verifier2", 10000, nullptr);
 	data360::FixedLoopbackListener malformed_listener(std::make_unique<RequestAcceptor>(
-	    "GET /oauth/callback?code=%GG&state=expected2 HTTP/1.1\r\nHost: 127.0.0.1:8910\r\n\r\n"));
+	    "GET /oauth/callback?code=%GG&state=expected2 HTTP/1.1\r\nHost: localhost:8910\r\n\r\n"));
 	std::thread malformed_worker([&] {
 		data360::ProcessAuthCallback(malformed_listener, registry, malformed_id, 5000, [] { return false; });
 	});

@@ -484,7 +484,7 @@ CallbackResult ParseOAuthCallbackRequest(const std::string &request) {
 		if (key == "content-length" || key == "transfer-encoding")
 			throw CallbackProtocolError("callback request body forbidden");
 		if (key == "host") {
-			if (found_host || value != "127.0.0.1:8910") throw CallbackProtocolError("invalid callback host");
+			if (found_host || value != "localhost:8910") throw CallbackProtocolError("invalid callback host");
 			found_host = true;
 		}
 		if (end == std::string::npos) break;
