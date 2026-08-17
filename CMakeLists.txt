@@ -71,7 +71,7 @@ add_executable(data360_unit_tests
     src/type_mapping.cpp)
 target_include_directories(data360_unit_tests PRIVATE src/include)
 target_compile_features(data360_unit_tests PRIVATE cxx_std_17)
-target_compile_options(data360_unit_tests PRIVATE -Wall -Wextra -Werror)
+target_compile_options(data360_unit_tests PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
 target_link_libraries(data360_unit_tests PRIVATE duckdb CURL::libcurl)
 add_test(NAME data360_unit_tests COMMAND data360_unit_tests)
 
