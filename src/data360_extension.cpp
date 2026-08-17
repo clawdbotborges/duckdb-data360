@@ -2,8 +2,11 @@
 
 #include "data360_extension.hpp"
 #include "data360/arrow_ipc_chunk_reader.hpp"
+#include "data360/auth_functions.hpp"
+#include "data360/auth_session_registry.hpp"
 #include "data360/native_runtime.hpp"
 #include "data360/scan_runtime.hpp"
+#include "data360/session_credentials.hpp"
 #include "data360/type_mapping.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -14,7 +17,7 @@
 #include "duckdb/main/client_context.hpp"
 
 #include <chrono>
-#include <cstdlib>
+
 #include <cstdio>
 #include <thread>
 #include <algorithm>
@@ -24,30 +27,13 @@
 namespace duckdb {
 namespace {
 
-class ProcessLocalData360Secret final : public KeyValueSecret {
-public:
-	ProcessLocalData360Secret(const vector<string> &scope, const string &type, const string &provider, const string &name)
-	    : KeyValueSecret(scope, type, provider, name) {
-		serializable = false;
-	}
-
-	ProcessLocalData360Secret(const ProcessLocalData360Secret &other) : KeyValueSecret(other) {
-		serializable = false;
-	}
-
-	unique_ptr<const BaseSecret> Clone() const override {
-		return make_uniq<ProcessLocalData360Secret>(*this);
-	}
-};
-
 class Data360BindData final : public TableFunctionData {
 public:
 	vector<LogicalType> types;
 	vector<string> names;
 	std::vector<data360::ColumnMetadata> metadata;
 	string sql;
-	string login_url;
-	string broker_path;
+	string credential_id;
 
 	bool SupportStatementCache() const override {
 		return false;
@@ -181,7 +167,7 @@ public:
 	}
 
 	DuckDBRuntime runtime;
-	data360::CurlProcessTransport transport;
+	data360::LibcurlTransport transport;
 	data360::JsonQueryResponseCodec codec;
 	data360::QueryApiV3Client client;
 	std::unique_ptr<data360::ChunkSource> source;
@@ -207,17 +193,6 @@ LogicalType BindLogicalType(const data360::TypeMapping &mapping) {
 	throw BinderException("Data 360 metadata contained an unsupported type");
 };
 
-unique_ptr<BaseSecret> CreateProcessSecret(ClientContext &, CreateSecretInput &input) {
-	if (input.persist_type == SecretPersistType::PERSISTENT) {
-		throw InvalidInputException("Data 360 process secrets must be temporary");
-	}
-	auto secret = make_uniq<ProcessLocalData360Secret>(input.scope, input.type, input.provider, input.name);
-	if (!secret->TrySetValue("login_url", input) || secret->TryGetValue("login_url", true).GetValue<string>().empty()) {
-		throw InvalidInputException("Data 360 process secret requires login_url");
-	}
-	return std::move(secret);
-}
-
 unique_ptr<FunctionData> Data360QueryBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
 	const auto secret_name = input.inputs[1].GetValue<string>();
@@ -229,25 +204,25 @@ unique_ptr<FunctionData> Data360QueryBind(ClientContext &context, TableFunctionB
 	if (secret->secret->GetType() != "data360") {
 		throw BinderException("Secret '%s' is not a Data 360 secret", secret_name);
 	}
-	if (secret->secret->GetProvider() != "process") {
+	if (secret->secret->GetProvider() != "oauth_pkce") {
 		throw BinderException("Data 360 secret '%s' uses an unsupported provider", secret_name);
 	}
-	const auto *broker_path = std::getenv("SOWVI_DATA360_BROKER_PATH");
-	if (!broker_path || !*broker_path) {
-		throw BinderException("SOWVI_DATA360_BROKER_PATH is required for the Data 360 process provider");
-	}
 	const auto &key_value = dynamic_cast<const KeyValueSecret &>(*secret->secret);
-	const auto login_url = key_value.TryGetValue("login_url", true).GetValue<string>();
+	Value session_value;
+	if (!key_value.TryGetValue("session_id", session_value) || session_value.IsNull()) {
+		throw BinderException("Data 360 OAuth secret is invalid");
+	}
+	const auto credential_id = session_value.GetValue<string>();
 	DuckDBRuntime runtime(context);
 	data360::QueryCredentials credentials;
 	try {
-		credentials = data360::ResolveProcessCapability(broker_path, login_url, &runtime);
+		credentials = Data360AuthState::Get(context).Registry().ResolveCredential(credential_id);
 	} catch (...) {
 		if (context.IsInterrupted()) throw InterruptException();
-		throw BinderException("Data 360 capability resolution failed");
+		throw BinderException(data360::FormatSafeFault(data360::AuthFault::REAUTH_REQUIRED));
 	}
 	try {
-		data360::CurlProcessTransport transport(&runtime);
+		data360::LibcurlTransport transport(&runtime);
 		data360::JsonQueryResponseCodec codec;
 		data360::QueryApiV3Client client(transport, codec, runtime);
 		const auto sql = input.inputs[0].GetValue<string>();
@@ -257,8 +232,7 @@ unique_ptr<FunctionData> Data360QueryBind(ClientContext &context, TableFunctionB
 		}
 		auto bind = make_uniq<Data360BindData>();
 		bind->sql = sql;
-		bind->login_url = login_url;
-		bind->broker_path = broker_path;
+		bind->credential_id = credential_id;
 		for (const auto &column : result.metadata) {
 			if (column.name.empty()) {
 				throw BinderException("Data 360 query returned an unnamed column");
@@ -275,6 +249,8 @@ unique_ptr<FunctionData> Data360QueryBind(ClientContext &context, TableFunctionB
 			bind->metadata.push_back(column);
 		}
 		return std::move(bind);
+	} catch (const data360::ReauthRequiredException &) {
+		throw BinderException(data360::FormatSafeFault(data360::AuthFault::REAUTH_REQUIRED));
 	} catch (const BinderException &) {
 		throw;
 	} catch (...) {
@@ -288,10 +264,10 @@ unique_ptr<GlobalTableFunctionState> Data360QueryInit(ClientContext &context, Ta
 	auto state = make_uniq<Data360GlobalState>(context);
 	data360::QueryCredentials credentials;
 	try {
-		credentials = data360::ResolveProcessCapability(bind.broker_path, bind.login_url, &state->runtime);
+		credentials = Data360AuthState::Get(context).Registry().ResolveCredential(bind.credential_id);
 	} catch (...) {
 		if (context.IsInterrupted()) throw InterruptException();
-		throw InvalidInputException("Data 360 capability resolution failed");
+		throw InvalidInputException(data360::FormatSafeFault(data360::AuthFault::REAUTH_REQUIRED));
 	}
 	try {
 		auto prepared = state->client.Prepare(bind.sql, credentials);
@@ -306,6 +282,8 @@ unique_ptr<GlobalTableFunctionState> Data360QueryInit(ClientContext &context, Ta
 			state->source = std::make_unique<data360::CursorChunkSource>(std::move(cursor));
 		}
 		return std::move(state);
+	} catch (const data360::ReauthRequiredException &) {
+		throw InvalidInputException(data360::FormatSafeFault(data360::AuthFault::REAUTH_REQUIRED));
 	} catch (const InvalidInputException &) {
 		throw;
 	} catch (...) {
@@ -323,6 +301,8 @@ void Data360QueryFunction(ClientContext &context, TableFunctionInput &input, Dat
 		} else {
 			data360::FillDataChunk(*state.source, state.scan_buffer, bind.types, bind.names, output);
 		}
+	} catch (const data360::ReauthRequiredException &) {
+		throw InvalidInputException(data360::FormatSafeFault(data360::AuthFault::REAUTH_REQUIRED));
 	} catch (const InvalidInputException &) {
 		throw;
 	} catch (...) {
@@ -335,19 +315,19 @@ void LoadInternal(ExtensionLoader &loader) {
 	SecretType secret_type;
 	secret_type.name = "data360";
 	secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
-	secret_type.default_provider = "process";
+	secret_type.default_provider = "oauth_pkce";
 	loader.RegisterSecretType(std::move(secret_type));
 
 	CreateSecretFunction secret_function;
 	secret_function.secret_type = "data360";
-	secret_function.provider = "process";
-	secret_function.function = CreateProcessSecret;
-	secret_function.named_parameters["login_url"] = LogicalType::VARCHAR;
+	secret_function.provider = "oauth_pkce";
+	secret_function.function = CreateOAuthPkceSecret;
 	loader.RegisterFunction(std::move(secret_function));
 
 	TableFunction function("data360_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, Data360QueryFunction,
 	                       Data360QueryBind, Data360QueryInit);
 	loader.RegisterFunction(function);
+	RegisterData360AuthFunctions(loader);
 }
 
 } // namespace

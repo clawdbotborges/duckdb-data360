@@ -13,14 +13,13 @@ Implemented and verified:
 - asynchronous polling and lazy, incrementally bounded result-chunk traversal;
 - canonical HTTPS-origin validation for exact `*.c360a.salesforce.com` DNS hosts;
 - request and overall timeouts;
-- best-effort remote `DELETE` with an independent 250 ms curl/process deadline when a local query is cancelled or
-  times out; final operating-system process reaping occurs after that deadline and is not represented as a strict
-  end-to-end wall-clock maximum;
+- best-effort remote `DELETE` with an independent 250 ms native HTTPS deadline when a local query is cancelled or
+  times out;
 - fail-closed query-ID and chunk-path validation, cycle detection, and bounded chunk traversal;
 - Arrow-ready scalar type mappings;
 - sanitized errors and dependency-injected unit tests.
-- a temporary, non-serializable `data360` secret provider;
-- a trusted process-local capability broker boundary;
+- S256 PKCE browser authorization through a fixed loopback callback;
+- a temporary, non-serializable `oauth_pkce` secret backed by process-memory credentials;
 - concrete TLS-verified HTTPS with redirects refused and bounded responses;
 - Query API V3 submission-ID recovery from Salesforce response headers;
 - authoritative precision/scale-driven DuckDB decimal binding;
@@ -32,7 +31,8 @@ Implemented and verified:
 
 Not yet implemented:
 
-- production Sowvi control-plane capability issuance (the current Python broker is development-local);
+- production Sowvi control-plane capability issuance;
+- signed Community Extension publication and live-gated Salesforce packaging proof;
 - predicate/projection pushdown beyond SQL explicitly supplied to `data360_query`;
 - bounded retry/backoff for proven transient and idempotent operations.
 
@@ -53,11 +53,11 @@ while it fills DuckDB vectors. Legacy direct responses retain one bounded JSON c
 
 - Do not pass access tokens, refresh tokens, client secrets, or tenant URLs as SQL literals.
 - Do not store production Salesforce credentials in ordinary persistent DuckDB secrets.
-- The development extension resolves a short-lived capability from a validated user-owned Python broker configured
-  through `SOWVI_DATA360_BROKER_PATH`. SQL cannot select the broker. The broker is opened with `O_NOFOLLOW`, checked
-  by descriptor, read through that descriptor, and supplied over stdin to the fixed root-owned `/usr/bin/python3`.
-  Production must replace this bridge with a
-  policy-bound Sowvi capability issuer.
+- Community authentication uses native HTTPS and Authorization Code with S256 PKCE. The extension is a public OAuth
+  client, contains no client secret, and does not invoke a credential subprocess, Python, Salesforce CLI, or a curl
+  executable.
+- Credential bytes remain in a database-instance registry. The temporary named secret contains only an opaque session
+  reference and non-sensitive provider metadata; it cannot be persisted or supplied directly through SQL.
 - Sowvi remains authoritative for grants, policy versions, revocation, credential policy, and usage accounting.
 - Data 360 executes SQL remotely and transfers results over HTTPS. This is not storage-level zero-copy.
 - Every concrete `HttpTransport` must honor `follow_redirects=false`, enforce `timeout_ms` and
@@ -102,8 +102,9 @@ build/debug/extension/data360/data360_unit_tests
 build/debug/extension/data360/data360_scan_tests
 build/debug/extension/data360/data360_arrow_ipc_tests
 
-# DuckDB SQLLogic registration and fail-closed behavior
+# DuckDB SQLLogic registration and fail-closed query/authentication behavior
 build/debug/test/unittest test/sql/data360_query.test
+build/debug/test/unittest test/sql/data360_auth.test
 
 # Manual load proof
 build/debug/duckdb -unsigned -csv -c \
@@ -120,17 +121,20 @@ function_type
 table
 ```
 
-## Development live query
+## Development interactive query
 
-Configure the broker path in the DuckDB process environment, create a temporary process secret containing only the
-Salesforce login origin, and query with the secret name:
+Start an interactive authorization session, open the returned authorization URL in a browser on the same computer,
+complete the callback, and query with the temporary secret name:
 
 ```sql
-CREATE SECRET data360_dev (
-    TYPE data360,
-    PROVIDER process,
-    LOGIN_URL 'https://your-org.my.salesforce.com'
+SELECT * FROM data360_auth_start(
+    'https://your-org.my.salesforce.com',
+    '<public-external-client-app-id>',
+    'data360_dev'
 );
+
+SELECT * FROM data360_auth_status('<auth_id>');
+SELECT * FROM data360_auth_complete('<auth_id>');
 
 SELECT *
 FROM data360_query(
@@ -139,4 +143,6 @@ FROM data360_query(
 );
 ```
 
-Persistent `data360` secrets and SQL-supplied broker paths are rejected.
+The callback is fixed at `http://127.0.0.1:8910/oauth/callback`. Authentication does not launch a browser or external
+program. Persistent `data360` secrets and caller-created credential-bearing secrets are rejected. See
+[`docs/community-authentication.md`](docs/community-authentication.md) for the complete contract and setup requirements.

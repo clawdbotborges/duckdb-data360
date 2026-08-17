@@ -1,0 +1,56 @@
+# name: test/sql/data360_auth.test
+# description: community OAuth SQL registration and safe pending/cancel flow
+# group: [sql]
+
+require data360
+
+query II
+SELECT count(*), count(*) FILTER (WHERE function_type = 'table')
+FROM duckdb_functions()
+WHERE function_name IN ('data360_auth_start','data360_auth_status','data360_auth_complete','data360_auth_cancel','data360_diagnostics');
+----
+5	4
+
+query I
+SELECT fault_protocol_version FROM data360_diagnostics();
+----
+1
+
+statement error
+SELECT * FROM data360_auth_start(NULL, 'client', 'safe_secret');
+----
+Data 360 auth arguments must not be NULL
+
+statement error
+SELECT * FROM data360_auth_start('https://login.salesforce.com', 'bad client', 'safe_secret');
+----
+D360-AUTH-002 INVALID_CLIENT_ID
+
+statement error
+SELECT * FROM data360_auth_start('https://login.salesforce.com', 'client', 'bad-name');
+----
+D360-AUTH-013 SECRET_NAME_INVALID
+
+statement error
+CREATE SECRET forged (TYPE data360, PROVIDER oauth_pkce);
+----
+Data 360 OAuth secrets are created by data360_auth_complete
+
+statement error
+CREATE PERSISTENT SECRET forged_persistent (TYPE data360, PROVIDER oauth_pkce);
+----
+D360-AUTH-014 PERSISTENCE_FORBIDDEN
+
+statement ok
+CREATE TEMP TABLE auth_started AS
+SELECT * FROM data360_auth_start('https://login.salesforce.com', 'client_123', 'sql_auth');
+
+query II
+SELECT status, data360_auth_cancel(auth_id) FROM auth_started;
+----
+PENDING_USER_ACTION	true
+
+query I
+SELECT count(*) FROM duckdb_secrets() WHERE provider = 'process';
+----
+0

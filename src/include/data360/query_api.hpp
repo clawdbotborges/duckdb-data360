@@ -4,10 +4,18 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace data360 {
+
+class ReauthRequiredException final : public std::runtime_error {
+public:
+	ReauthRequiredException()
+	    : std::runtime_error("D360-AUTH-017 REAUTH_REQUIRED: Authorization is required") {
+	}
+};
 
 using Cell = std::optional<std::string>;
 

@@ -2,15 +2,13 @@
 #include "data360/native_runtime.hpp"
 #include "data360/type_mapping.hpp"
 
-#include <chrono>
 #include <cstdlib>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
-#include <sys/stat.h>
-#include <thread>
-#include <unistd.h>
 
 using namespace data360;
 
@@ -20,6 +18,22 @@ void Require(bool condition, const char *message) {
 	if (!condition) {
 		throw std::runtime_error(message);
 	}
+}
+
+std::string ReadSourceFile(const std::string &relative_path) {
+	std::string test_path = __FILE__;
+	for (auto &character : test_path) {
+		if (character == '\\') character = '/';
+	}
+	const auto marker = test_path.rfind("test/unit/query_api_test.cpp");
+	Require(marker != std::string::npos, "test source path did not identify the repository root");
+	std::ifstream input(test_path.substr(0, marker) + relative_path, std::ios::binary);
+	Require(input.good(), "community runtime source could not be opened");
+	return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+void RequireDoesNotContain(const std::string &source, const std::string &needle, const char *message) {
+	Require(source.find(needle) == std::string::npos, message);
 }
 
 class RecordingTransport final : public HttpTransport {
@@ -106,6 +120,105 @@ public:
 		}
 	}
 };
+
+constexpr const char *REAUTH_MESSAGE = "D360-AUTH-017 REAUTH_REQUIRED: Authorization is required";
+
+void RequireReauth(const std::function<void()> &operation, const char *message) {
+	std::string error;
+	bool typed = false;
+	try {
+		operation();
+	} catch (const ReauthRequiredException &exception) {
+		typed = true;
+		error = exception.what();
+	}
+	Require(typed, message);
+	Require(error == REAUTH_MESSAGE, "reauth failure must use the exact stable error");
+	Require(error.find("SENSITIVE_PROVIDER_BODY") == std::string::npos,
+	        "reauth failure must not expose the provider response body");
+}
+
+void TestMapsQueryApi401AtEveryRemoteStageToStableReauth() {
+	const HttpResponse unauthorized {401, "SENSITIVE_PROVIDER_BODY token=https://attacker.example/secret"};
+	const QueryCredentials credentials {"https://tenant.c360a.salesforce.com", "token"};
+
+	{
+		RecordingTransport transport;
+		transport.responses.push_back(unauthorized);
+		JsonQueryResponseCodec codec;
+		FakeRuntime runtime;
+		QueryApiV3Client client(transport, codec, runtime);
+		RequireReauth([&]() { (void)client.Prepare("select 1", credentials); },
+		              "submit 401 must require reauthorization");
+	}
+	for (const auto &stage : {std::string("status"), std::string("metadata"), std::string("chunk")}) {
+		RecordingTransport transport;
+		transport.responses.push_back({202, R"({"queryId":"query-auth"})"});
+		transport.responses.push_back(stage == "status"
+		                                  ? unauthorized
+		                                  : HttpResponse {200, R"({"completionStatus":"FINISHED","chunkCount":1,"rowCount":1})"});
+		if (stage != "status") {
+			transport.responses.push_back(stage == "metadata"
+			                                  ? unauthorized
+			                                  : HttpResponse {200, R"({"metadata":{"columns":[{"name":"id","type":"varchar","nullable":false}]}})"});
+		}
+		if (stage == "chunk") transport.responses.push_back(unauthorized);
+		JsonQueryResponseCodec codec;
+		FakeRuntime runtime;
+		QueryApiV3Client client(transport, codec, runtime);
+		if (stage == "chunk") {
+			auto cursor = std::move(client.Prepare("select id from fixture", credentials)).OpenCursor();
+			ResultChunk chunk;
+			RequireReauth([&]() { (void)cursor.NextChunk(chunk); }, "chunk 401 must require reauthorization");
+		} else {
+			RequireReauth([&]() { (void)client.Prepare("select id from fixture", credentials); },
+			              stage == "status" ? "status 401 must require reauthorization"
+			                                : "metadata 401 must require reauthorization");
+		}
+	}
+	{
+		RecordingTransport transport;
+		transport.responses.push_back({202, R"({"queryId":"query-arrow-auth"})"});
+		transport.responses.push_back({200, R"({"completionStatus":"FINISHED","chunkCount":1,"rowCount":1})"});
+		transport.responses.push_back({200, R"({"metadata":{"columns":[{"name":"id","type":"varchar","nullable":false}]}})"});
+		transport.responses.push_back(unauthorized);
+		JsonQueryResponseCodec codec;
+		FakeRuntime runtime;
+		QueryApiV3Client client(transport, codec, runtime);
+		auto cursor = std::move(client.Prepare("select id from fixture", credentials)).OpenCursor();
+		HttpResponse response;
+		RequireReauth([&]() { (void)cursor.NextArrowChunk(response); },
+		              "Arrow chunk 401 must require reauthorization");
+	}
+}
+
+void TestMapsOnlyExplicitAuthInvalid403ToStableReauth() {
+	JsonQueryResponseCodec codec;
+	RequireReauth([&]() {
+		(void)codec.Decode({403, R"({"errorCode":"INVALID_SESSION_ID","message":"SENSITIVE_PROVIDER_BODY"})"});
+	}, "explicit invalid-session 403 must require reauthorization");
+	RequireReauth([&]() {
+		(void)codec.Decode({403, R"([{"errorCode":"INVALID_SESSION_ID","message":"SENSITIVE_PROVIDER_BODY"}])"});
+	}, "single provider invalid-session array must require reauthorization");
+
+	for (const auto &response : {
+	         HttpResponse {403, R"({"errorCode":"INSUFFICIENT_ACCESS","message":"SENSITIVE_PROVIDER_BODY"})"},
+	         HttpResponse {403, "SENSITIVE_PROVIDER_BODY"},
+	         HttpResponse {500, R"({"errorCode":"INVALID_SESSION_ID"})"},
+	     }) {
+		std::string error;
+		try {
+			(void)codec.Decode(response);
+		} catch (const ReauthRequiredException &) {
+			throw std::runtime_error("non-auth Query API failure was incorrectly classified as reauth");
+		} catch (const std::runtime_error &exception) {
+			error = exception.what();
+		}
+		Require(error == "Data 360 Query API request failed", "non-auth status behavior must remain generic");
+		Require(error.find("SENSITIVE_PROVIDER_BODY") == std::string::npos,
+		        "generic Query API failure must redact provider response bodies");
+	}
+}
 
 void TestPostsQueryWithoutCredentialsInBody() {
 	RecordingTransport transport;
@@ -1448,40 +1561,42 @@ void TestDecodesLiveV3HeaderStatusAndCombinedChunks() {
 	        "direct pagination must accept only a string from the bounded provider 'next' field");
 }
 
-void TestBrokerSubprocessObservesCancellation() {
-	char path[] = "/tmp/data360-cancel-broker-XXXXXX";
-	const auto fd = mkstemp(path);
-	Require(fd >= 0, "temporary cancellation broker creation failed");
-	const std::string script = "import time\ntime.sleep(30)\n";
-	Require(write(fd, script.data(), script.size()) == static_cast<ssize_t>(script.size()),
-	        "temporary cancellation broker write failed");
-	Require(fchmod(fd, 0700) == 0, "temporary cancellation broker permissions failed");
-	close(fd);
-	std::atomic<bool> cancelled {false};
-	SteadyRuntime runtime(&cancelled);
-	std::thread canceller([&]() {
-		std::this_thread::sleep_for(std::chrono::milliseconds(50));
-		cancelled.store(true);
-	});
-	const auto started = std::chrono::steady_clock::now();
-	bool rejected = false;
-	try {
-		ResolveProcessCapability(path, "https://org.my.salesforce.com", &runtime);
-	} catch (const std::exception &) {
-		rejected = true;
+void TestCommunityRuntimeHasNoExecutableCredentialPath() {
+	const auto header = ReadSourceFile("src/include/data360/native_runtime.hpp");
+	const auto implementation = ReadSourceFile("src/native_runtime.cpp");
+	const auto extension = ReadSourceFile("src/data360_extension.cpp");
+	const auto runtime_source = header + implementation + extension;
+	for (const auto &symbol : {std::string("Resolve") + "ProcessCapability", std::string("Run") + "Process(",
+	                          std::string("Kill") + "AndReap", std::string("Minimal") + "Environment"}) {
+		RequireDoesNotContain(runtime_source, symbol, "community runtime retained a process credential symbol");
 	}
-	canceller.join();
-	unlink(path);
-	const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-	                         std::chrono::steady_clock::now() - started).count();
-	Require(rejected, "cancelled broker subprocess must fail closed");
-	Require(elapsed < 2000, "broker subprocess cancellation must be bounded");
+	for (const auto &dependency : {std::string("/usr/bin/") + "python3", std::string("/usr/bin/") + "curl",
+	                              std::string("SOWVI_DATA360_") + "BROKER_PATH"}) {
+		RequireDoesNotContain(runtime_source, dependency, "community runtime retained an executable credential dependency");
+	}
+	for (const auto &header_name : {"<poll.h>", "<spawn.h>", "<sys/socket.h>", "<sys/wait.h>", "<unistd.h>"}) {
+		RequireDoesNotContain(implementation, header_name, "native runtime retained a POSIX process header");
+	}
+
+	RecordingTransport transport;
+	transport.responses.push_back({200, "complete"});
+	ScriptedCodec codec;
+	QueryResponse complete;
+	complete.state = QueryState::COMPLETE;
+	codec.responses.push_back(complete);
+	FakeRuntime runtime;
+	QueryApiV3Client client(transport, codec, runtime);
+	client.Execute("select 1", {"https://tenant.c360a.salesforce.com", "token"});
+	Require(transport.requests.size() == 1,
+	        "query execution unexpectedly depended on an external credential executable");
 }
 
 } // namespace
 
 int main() {
 	try {
+		TestMapsQueryApi401AtEveryRemoteStageToStableReauth();
+		TestMapsOnlyExplicitAuthInvalid403ToStableReauth();
 		TestPostsQueryWithoutCredentialsInBody();
 		TestEscapesEveryJsonControlCharacterInSql();
 		TestNumberedCursorFetchesOneChunkAtATime();
@@ -1520,7 +1635,7 @@ int main() {
 		TestRejectsInvalidQueryOptions();
 		TestPreservesExactUnquotedDecimalLexeme();
 		TestDecodesLiveV3HeaderStatusAndCombinedChunks();
-		TestBrokerSubprocessObservesCancellation();
+		TestCommunityRuntimeHasNoExecutableCredentialPath();
 		std::cout << "query_api_test: PASS\n";
 		return EXIT_SUCCESS;
 	} catch (const std::exception &error) {

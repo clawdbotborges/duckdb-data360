@@ -6,6 +6,11 @@
     {
       "name": "nanoarrow",
       "features": ["ipc"]
+    },
+    {
+      "name": "curl",
+      "default-features": false,
+      "features": ["ssl"]
     }
   ],
   "overrides": [

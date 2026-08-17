@@ -1,47 +1,28 @@
 # name: test/sql/data360_query.test
-# description: data360 read-only table function registration
+# description: data360 query requires a registry-backed oauth_pkce secret
 # group: [sql]
 
 require data360
 
 query I
-SELECT function_type
-FROM duckdb_functions()
-WHERE function_name = 'data360_query';
+SELECT function_type FROM duckdb_functions() WHERE function_name = 'data360_query';
 ----
 table
 
-statement ok
-CREATE SECRET data360_test (
-    TYPE data360,
-    PROVIDER process,
-    LOGIN_URL 'https://org.my.salesforce.com'
-);
-
-query III
-SELECT name, type, provider
-FROM duckdb_secrets()
-WHERE name = 'data360_test';
+statement error
+CREATE SECRET forged_data360 (TYPE data360, PROVIDER oauth_pkce);
 ----
-data360_test	data360	process
+Data 360 OAuth secrets are created by data360_auth_complete
 
 statement error
-CREATE PERSISTENT SECRET forbidden_data360 (
-    TYPE data360,
-    PROVIDER process,
-    LOGIN_URL 'https://org.my.salesforce.com'
-);
+CREATE PERSISTENT SECRET forbidden_data360 (TYPE data360, PROVIDER oauth_pkce);
 ----
-Data 360 process secrets must be temporary
+D360-AUTH-014 PERSISTENCE_FORBIDDEN
 
 statement error
-CREATE SECRET executable_injection (
-    TYPE data360,
-    PROVIDER process,
-    BROKER_PATH '/tmp/attacker-controlled'
-);
+CREATE SECRET process_injection (TYPE data360, PROVIDER process, LOGIN_URL 'https://org.my.salesforce.com');
 ----
-Unknown parameter 'broker_path'
+Secret provider 'process' not found for type 'data360'
 
 statement error
 SELECT * FROM data360_query('select 1', 'missing_secret');

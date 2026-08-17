@@ -191,6 +191,8 @@ struct Session {
 	QueryResponse Decode(const HttpResponse &response) {
 		try {
 			return codec->Decode(response);
+		} catch (const ReauthRequiredException &) {
+			throw;
 		} catch (...) {
 			if (runtime->IsCancelled()) throw std::runtime_error("Data 360 query cancelled");
 			throw std::runtime_error("Data 360 response decoding failed");
@@ -354,8 +356,15 @@ bool QueryCursor::NextArrowChunk(HttpResponse &response) {
 		session.request.url = TrimTrailingSlash(session.credentials.instance_url) + "/api/v3/query/" + session.query_id +
 		                      "/chunks/" + std::to_string(session.next_chunk_index);
 		response = session.Send(session.request);
-		if (response.status < 200 || response.status >= 300)
+		if (response.status < 200 || response.status >= 300) {
+			try {
+				(void)session.codec->Decode(response);
+			} catch (const ReauthRequiredException &) {
+				throw;
+			} catch (...) {
+			}
 			throw std::runtime_error("Data 360 Query API chunk retrieval failed");
+		}
 		session.CheckActive();
 		session.arrow_response_outstanding = true;
 		return true;

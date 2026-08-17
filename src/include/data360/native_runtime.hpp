@@ -6,12 +6,9 @@
 
 namespace data360 {
 
-QueryCredentials ResolveProcessCapability(const std::string &broker_path, const std::string &login_url,
-                                          RuntimeHooks *runtime = nullptr);
-
-class CurlProcessTransport final : public HttpTransport {
+class LibcurlTransport final : public HttpTransport {
 public:
-	explicit CurlProcessTransport(RuntimeHooks *runtime = nullptr) : runtime(runtime) {
+	explicit LibcurlTransport(RuntimeHooks *runtime = nullptr) : runtime(runtime) {
 	}
 	HttpResponse Send(const HttpRequest &request) override;
 
